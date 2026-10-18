@@ -1,185 +1,770 @@
-#!/usr/bin/env bash
-# Copy or move ROM files to a PortareOS device over SSH.
-set -euo pipefail
-shopt -s nocasematch
+#!/usr/bin/env python3
+"""Copy or move ROMs to PortareOS over SSH, converting disc images to CHD."""
 
-usage() {
-  cat <<'EOF'
-Usage: nova-push [options] [system] file ...
-       nova-push [--host [user@]host] --list
-       nova-push --set-host [user@]host
+from __future__ import annotations
 
-Copy files into /storage/roms/<system>/ on a PortareOS device.
-Omit the system only when every file extension identifies the same system.
-Disc images must be CHD: ISO/CUE/GDI inputs are converted and verified first.
-Cartridge ROMs are copied unchanged; other disc formats are rejected.
+import argparse
+import errno
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
-Options (before the system and files):
-  -H, --host HOST       SSH destination for this command
-      --set-host HOST   Save a default destination for future commands
-  -m, --move            Remove each local file after rsync confirms delivery
-  -n, --dry-run         Preview the transfer without copying or removing files
-      --iso-type TYPE   ISO media type: auto (detect PS2 CD/DVD), cd, or dvd
-  -l, --list            List the device's system folders
-  -h, --help            Show this help
-  --                   End options (for filenames beginning with a dash)
+SUPPORTED = {".cue", ".gdi", ".iso"}
+ENCODED_AUDIO = {"MP3", "AIFF", "FLAC", "OGG"}
+FILE_LINE = re.compile(r'\s*FILE\s+(?:"([^"]+)"|([^"\s]+))\s+(\S+)\s*', re.IGNORECASE)
+TRACK_LINE = re.compile(r"\s*TRACK\s+\d+\s+(\S+)", re.IGNORECASE)
 
-Examples:
-  nova-push --set-host root@device
-  nova-push ps2 game.chd
-  nova-push ps2 cd-game.iso
-  nova-push game.sfc
-  nova-push --host device --dry-run --move psp game.iso
 
-Host priority: --host, then NOVA, then the saved default.
-The default is stored in ${XDG_CONFIG_HOME:-$HOME/.config}/nova-push/host.
-Requires Bash, Python 3.10+, SSH, and rsync locally, and rsync on the device.
-Conversion also requires chdman (and FFmpeg for encoded CUE audio).
-Use an SSH config alias for custom ports, keys, or IPv6 addresses.
-EOF
+class ConversionError(Exception):
+    """An actionable conversion failure, displayed without a traceback."""
+
+
+@dataclass(frozen=True)
+class CueFile:
+    line: int
+    source: Path
+    kind: str
+
+
+@dataclass(frozen=True)
+class Job:
+    source: Path
+    output: Path
+
+
+def read_cue(source: Path) -> tuple[list[str], list[CueFile]]:
+    data = source.read_bytes()
+    try:
+        contents = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        contents = data.decode("cp1252", errors="replace")
+    lines = contents.splitlines()
+    files: list[CueFile] = []
+    tracks = 0
+    for number, line in enumerate(lines):
+        if re.match(r"\s*FILE\b", line, re.IGNORECASE):
+            match = FILE_LINE.fullmatch(line)
+            if not match:
+                raise ConversionError(f"{source.name}:{number + 1}: invalid FILE line")
+            name = match[1] or match[2]
+            target = source.parent / name
+            if not target.is_file():
+                # CUE sheets distributed for Windows often use backslashes.
+                target = source.parent / name.replace("\\", "/")
+            kind = match[3].upper()
+            if kind not in {"BINARY", "MOTOROLA", "WAVE"} | ENCODED_AUDIO:
+                raise ConversionError(
+                    f"{source.name}: unsupported CUE file type: {kind}"
+                )
+            files.append(CueFile(number, target.resolve(), kind))
+        track = TRACK_LINE.match(line)
+        if track:
+            if not files:
+                raise ConversionError(f"{source.name}: TRACK appears before FILE")
+            if files[-1].kind in ENCODED_AUDIO and track[1].upper() != "AUDIO":
+                raise ConversionError(
+                    f"{source.name}: encoded audio must use TRACK AUDIO"
+                )
+            tracks += 1
+    if not files or not tracks:
+        raise ConversionError(f"{source.name}: CUE must contain FILE and TRACK entries")
+    return lines, files
+
+
+def plan_jobs(inputs: list[Path], output: Path | None, recursive: bool) -> list[Job]:
+    jobs: dict[Path, Job] = {}
+    for argument in inputs:
+        source = argument.expanduser().resolve()
+        if source.is_dir():
+            candidates = source.rglob("*") if recursive else source.iterdir()
+            images = sorted(
+                (
+                    p
+                    for p in candidates
+                    if p.is_file() and p.suffix.lower() in SUPPORTED
+                ),
+                key=lambda p: str(p).casefold(),
+            )
+            for image in images:
+                destination = (
+                    output / image.relative_to(source).with_suffix(".chd")
+                    if output
+                    else image.with_suffix(".chd")
+                )
+                jobs.setdefault(image.resolve(), Job(image.resolve(), destination))
+        elif source.is_file():
+            if source.suffix.lower() not in SUPPORTED:
+                raise ConversionError(
+                    f"Unsupported input: {source.name}. Select a .cue, .gdi or .iso; "
+                    "for BIN or audio tracks, select their CUE sheet."
+                )
+            destination = (
+                output / source.with_suffix(".chd").name
+                if output
+                else source.with_suffix(".chd")
+            )
+            jobs.setdefault(source, Job(source, destination))
+        else:
+            raise ConversionError(f"Input does not exist: {source}")
+
+    # An ISO referenced by a CUE is part of that disc, not a separate game.
+    referenced: set[Path] = set()
+    for job in jobs.values():
+        if job.source.suffix.lower() == ".cue":
+            try:
+                _, files = read_cue(job.source)
+            except (ConversionError, OSError):
+                continue  # Report a broken disc when its conversion is attempted.
+            referenced.update(entry.source for entry in files)
+    planned = [
+        Job(job.source, job.output.with_name(job.output.name.replace(" ", "_")))
+        for job in jobs.values()
+        if job.source not in referenced
+    ]
+    if not planned:
+        raise ConversionError(
+            "No .cue, .gdi or .iso images found. Use --recursive to search subfolders."
+        )
+    destinations: dict[str, Path] = {}
+    for job in planned:
+        # Also catch collisions on the usual case-insensitive macOS volumes.
+        key = str(job.output.resolve()).casefold()
+        if key in destinations:
+            raise ConversionError(
+                f"Output collision: {destinations[key]} and {job.source} both map to {job.output}. "
+                "Convert separately or use a common input folder with --recursive."
+            )
+        destinations[key] = job.source
+    return planned
+
+
+def find_tool(name: str, override: str | None) -> str:
+    candidate = override or os.environ.get(name.upper()) or name
+    executable = shutil.which(os.path.expanduser(candidate))
+    if executable:
+        return str(Path(executable).resolve())
+    raise ConversionError(
+        f"Cannot find {name}: {candidate}. On macOS: brew install rom-tools ffmpeg. "
+        "On Debian/Ubuntu: sudo apt install mame-tools ffmpeg. "
+        f"Or set {name.upper()}=/path/to/{name}."
+    )
+
+
+def run(command: list[str], *, cwd: Path | None = None) -> None:
+    try:
+        subprocess.run(command, cwd=cwd, stdin=subprocess.DEVNULL, check=True)
+    except subprocess.CalledProcessError as error:
+        raise ConversionError(
+            f"{Path(command[0]).name} failed (exit {error.returncode}); see output above."
+        ) from error
+
+
+def prepare_cue(source: Path, work: Path, ffmpeg: str | None) -> Path:
+    lines, files = read_cue(source)
+    for entry in files:
+        if not entry.source.is_file():
+            raise ConversionError(
+                f"Missing track referenced by {source.name}: {entry.source}"
+            )
+
+    # Short local symlinks keep paths portable and avoid copying large BIN/ISO files.
+    prepared: dict[tuple[Path, str], str] = {}
+    for entry in files:
+        key = (entry.source, entry.kind)
+        if key not in prepared:
+            number = len(prepared) + 1
+            if entry.kind in ENCODED_AUDIO:
+                executable = find_tool("ffmpeg", ffmpeg)
+                name = f"audio-{number:03d}.wav"
+                print(f"  Preparing audio: {entry.source.name}", flush=True)
+                run(
+                    [
+                        executable,
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-i",
+                        str(entry.source),
+                        "-map",
+                        "0:a:0",
+                        "-vn",
+                        "-ac",
+                        "2",
+                        "-af",
+                        "aresample=44100,asetnsamples=n=588:p=1",
+                        "-ar",
+                        "44100",
+                        "-c:a",
+                        "pcm_s16le",
+                        str(work / name),
+                    ]
+                )
+                # 588 stereo samples = one 2352-byte CD sector. The filter pads
+                # the last sector with silence so chdman won't truncate samples.
+            else:
+                name = f"source-{number:03d}{entry.source.suffix}"
+                try:
+                    (work / name).symlink_to(entry.source)
+                except OSError as error:
+                    if error.errno not in {errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS}:
+                        raise
+                    shutil.copyfile(entry.source, work / name)
+            prepared[key] = name
+        kind = "WAVE" if entry.kind in ENCODED_AUDIO else entry.kind
+        lines[entry.line] = f'FILE "{prepared[key]}" {kind}'
+    cue = work / "disc.cue"
+    cue.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cue
+
+
+def publish(staged: Path, output: Path, overwrite: bool) -> None:
+    if overwrite:
+        os.replace(staged, output)
+        return
+    try:
+        # Unlike rename(), link() atomically refuses an existing destination.
+        os.link(staged, output)
+    except OSError as error:
+        if error.errno not in {
+            errno.EPERM,
+            errno.EOPNOTSUPP,
+            errno.ENOSYS,
+            errno.EXDEV,
+        }:
+            raise
+        # FAT/exFAT output volumes cannot hard-link; exclusive creation still
+        # protects existing files, and interrupted copies remove their output.
+        with output.open("xb") as destination:
+            try:
+                with staged.open("rb") as source:
+                    shutil.copyfileobj(source, destination)
+                destination.flush()
+            except BaseException:
+                output.unlink()
+                raise
+
+
+def convert(job: Job, args: argparse.Namespace, chdman: str) -> bool:
+    if os.path.lexists(job.output) and not args.overwrite:
+        print(f"Skipped existing: {job.output}", flush=True)
+        return False
+    job.output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Converting: {job.source}\n        to: {job.output}", flush=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".portare-chd-", dir=job.output.parent
+    ) as temporary:
+        work = Path(temporary)
+        image = (
+            prepare_cue(job.source, work, args.ffmpeg)
+            if job.source.suffix.lower() == ".cue"
+            else job.source
+        )
+        command = (
+            "createdvd"
+            if job.source.suffix.lower() == ".iso" and args.iso_type == "dvd"
+            else "createcd"
+        )
+        staged = work / "output.chd"
+        options = [chdman, command, "-i", str(image), "-o", str(staged)]
+        # Use established codecs supported by handheld emulators' libchdr.
+        codecs = "lzma,zlib,huff,flac" if command == "createdvd" else "cdlz,cdzl,cdfl"
+        options.extend(["-c", codecs])
+        if args.jobs:
+            options.extend(["-np", str(args.jobs)])
+        run(options, cwd=work)
+        if not args.no_verify:
+            print("  Verifying CHD…", flush=True)
+            run([chdman, "verify", "-i", str(staged)])
+        publish(staged, job.output, args.overwrite)
+    print(
+        f"Created: {job.output} ({job.output.stat().st_size / (1024 * 1024):.1f} MiB)",
+        flush=True,
+    )
+    return True
+
+
+CARTRIDGE_SYSTEMS = {
+    "nes",
+    "famicom",
+    "snes",
+    "sfc",
+    "gb",
+    "gbc",
+    "gba",
+    "n64",
+    "nds",
+    "3ds",
+    "megadrive",
+    "genesis",
+    "sega32x",
+    "mastersystem",
+    "gamegear",
+    "sg1000",
+    "sg-1000",
+    "pcengine",
+    "tg16",
+    "supergrafx",
+    "virtualboy",
+    "ngp",
+    "ngpc",
+    "wonderswan",
+    "wonderswancolor",
+    "atari2600",
+    "atari5200",
+    "atari7800",
+    "atarilynx",
+    "colecovision",
+    "intellivision",
+    "odyssey2",
+    "vectrex",
+    "supervision",
+    "pokemini",
+    "neogeo",
+}
+CARTRIDGE_FORMATS = {
+    ".nes",
+    ".sfc",
+    ".smc",
+    ".gb",
+    ".gbc",
+    ".gba",
+    ".z64",
+    ".n64",
+    ".v64",
+    ".nds",
+    ".3ds",
+    ".md",
+    ".gen",
+    ".32x",
+    ".sms",
+    ".gg",
+    ".sg",
+    ".pce",
+    ".vb",
+    ".ngp",
+    ".ngc",
+    ".ws",
+    ".wsc",
+    ".a26",
+    ".a52",
+    ".a78",
+    ".lnx",
+    ".col",
+    ".int",
+    ".vec",
+    ".sv",
+    ".min",
+    ".neo",
+    ".bin",
+    ".rom",
+    ".zip",
+    ".7z",
+}
+CD_SYSTEMS = {
+    "psx",
+    "ps1",
+    "playstation",
+    "swanstation",
+    "dreamcast",
+    "flycast",
+    "neogeocd",
+    "segacd",
+    "megacd",
+    "saturn",
+    "pcenginecd",
+    "tg16cd",
+    "pcfx",
+    "3do",
+    "cdi",
+}
+PS2_SYSTEMS = {"ps2", "armsx2"}
+DVD_SYSTEMS = PS2_SYSTEMS | {"psp"}
+
+
+@dataclass(frozen=True)
+class Transfer:
+    source: Path
+    upload: Path
+    conversion: Job | None = None
+
+
+def detect_ps2_iso_type(source: Path) -> str:
+    """Apply PCSX2's CD/DVD heuristic to a cooked, 2048-byte-sector ISO."""
+    sectors, remainder = divmod(source.stat().st_size, 2048)
+    with source.open("rb") as image:
+        image.seek(16 * 2048)
+        descriptor = image.read(2048)
+    if remainder or len(descriptor) != 2048 or descriptor[:7] != b"\x01CD001\x01":
+        raise ConversionError(
+            f"Cannot detect PS2 CD/DVD media type: {source.name}; "
+            "expected an ISO9660 image with 2048-byte sectors. "
+            "Select the CUE for raw CD tracks, or use --iso-type cd or --iso-type dvd "
+            "for an image with nonstandard metadata."
+        )
+
+    # PCSX2/CDVD/CDVDcommon.cpp::FindDiskType: images beyond this sector
+    # count are DVDs. Smaller images use the root directory length in the PVD.
+    # https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp
+    if sectors > 452849:
+        return "dvd"
+    root_size = int.from_bytes(descriptor[166:170], "little")
+    if not root_size or root_size != int.from_bytes(descriptor[170:174], "big"):
+        raise ConversionError(
+            f"Cannot detect PS2 CD/DVD media type: {source.name}; "
+            "invalid ISO9660 root directory length. "
+            "Use --iso-type cd or --iso-type dvd to override."
+        )
+    return "cd" if descriptor[166:168] == descriptor[171:173] else "dvd"
+
+
+def media_type(source: Path, system: str, iso_type: str) -> str:
+    if source.suffix.lower() != ".iso":
+        return "cd"  # CUE/GDI always describe CDs.
+    if iso_type != "auto":
+        return iso_type
+    if system.casefold() in PS2_SYSTEMS:
+        return detect_ps2_iso_type(source)
+    return "cd" if system.casefold() in CD_SYSTEMS else "dvd"
+
+
+def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Transfer]:
+    system = system.casefold()
+    images = []
+    passthrough = []
+    for source in sources:
+        extension = source.suffix.lower()
+        if extension == ".chd" or (
+            system in CARTRIDGE_SYSTEMS and extension in CARTRIDGE_FORMATS
+        ):
+            passthrough.append(Transfer(source, source))
+        elif extension in SUPPORTED and system in CD_SYSTEMS | DVD_SYSTEMS:
+            images.append(source)
+        else:
+            raise ConversionError(
+                f"Non-CHD transfers are only allowed for cartridge ROMs: {source.name}. "
+                "For supported disc systems, supply a CHD or an ISO/CUE/GDI to convert. "
+                "Select the CUE sheet for BIN/audio tracks; extract disc archives first."
+            )
+
+    jobs = plan_jobs(images, output, False) if images else []
+    planned = {job.source: Transfer(job.source, job.output, job) for job in jobs}
+    planned.update({item.source.resolve(): item for item in passthrough})
+    # plan_jobs excludes ISOs referenced by a selected CUE sheet.
+    transfers = [
+        planned[source.resolve()] for source in sources if source.resolve() in planned
+    ]
+    names = set()
+    for item in transfers:
+        name = item.upload.name.casefold()
+        if name in names:
+            raise ConversionError(f"duplicate destination filename: {item.upload.name}")
+        names.add(name)
+    return transfers
+
+
+def push(
+    host: str,
+    system: str,
+    transfers: list[Transfer],
+    *,
+    move: bool,
+    dry_run: bool,
+    iso_type: str = "auto",
+) -> int:
+    # Probe the entire batch before converting or uploading any of it.
+    conversions = [
+        (item, media_type(item.source, system, iso_type))
+        for item in transfers
+        if item.conversion
+    ]
+    chdman = find_tool("chdman", None) if conversions and not dry_run else None
+    destination = f"/storage/roms/{system}/"
+    if subprocess.run(["ssh", host, f"test -d {destination}"], check=False).returncode:
+        print(
+            f"nova-push: cannot access {host}:{destination}; "
+            "check SSH and use --list to see system folders",
+            file=sys.stderr,
+        )
+        return 1
+
+    for item, selected_type in conversions:
+        if dry_run:
+            print(
+                f"nova-push: would convert and verify {item.source} "
+                f"-> {host}:{destination}{item.upload.name} (chdman create{selected_type})",
+                flush=True,
+            )
+        else:
+            print(
+                f"nova-push: {item.source.name}: using chdman create{selected_type}",
+                flush=True,
+            )
+            args = argparse.Namespace(
+                iso_type=selected_type,
+                ffmpeg=None,
+                jobs=None,
+                no_verify=False,
+                overwrite=False,
+            )
+            convert(item.conversion, args, chdman)
+
+    # A dry run previews future CHDs above; rsync needs actual source files.
+    uploads = [item for item in transfers if not (dry_run and item.conversion)]
+    if uploads:
+        options = ["-th", "--progress", "--partial-dir=.nova-push-partial", "--rsh=ssh"]
+        if move:
+            options.extend(["--checksum", "--remove-source-files"])
+        if dry_run:
+            options.append("--dry-run")
+        status = subprocess.run(
+            [
+                "rsync",
+                *options,
+                "--",
+                *(str(item.upload) for item in uploads),
+                f"{host}:{destination}",
+            ],
+            check=False,
+        ).returncode
+        if status:
+            return status if status > 0 else 128 - status
+
+    if move and not dry_run:
+        for item, _ in conversions:
+            # rsync removes a staged CHD only after confirming its delivery.
+            # A failed batch retains every original conversion input.
+            if not item.upload.exists():
+                item.source.unlink()
+
+    action = (
+        "dry run; no files copied or removed"
+        if dry_run
+        else "moved"
+        if move
+        else "copied"
+    )
+    print(f"nova-push: {len(transfers)} file(s) -> {host}:{destination} ({action})")
+    return 0
+
+
+class UsageError(Exception):
+    """Invalid command-line arguments or configuration."""
+
+
+INFERRED_SYSTEMS = {
+    extension: system
+    for system, extensions in {
+        "nes": ("nes",),
+        "snes": ("sfc", "smc"),
+        "gb": ("gb",),
+        "gbc": ("gbc",),
+        "gba": ("gba",),
+        "n64": ("z64", "n64", "v64"),
+        "nds": ("nds",),
+        "megadrive": ("md", "gen"),
+        "pcengine": ("pce",),
+        "virtualboy": ("vb",),
+        "ngpc": ("ngp", "ngc"),
+        "wonderswancolor": ("ws", "wsc"),
+        "gamegear": ("gg",),
+        "mastersystem": ("sms",),
+    }.items()
+    for extension in extensions
 }
 
-fail() {
-  echo "nova-push: $*" >&2
-  exit 2
-}
 
-infer_system() {
-  case "${1##*.}" in
-    nes) echo nes ;; sfc|smc) echo snes ;; gb) echo gb ;; gbc) echo gbc ;;
-    gba) echo gba ;; z64|n64|v64) echo n64 ;; nds) echo nds ;;
-    md|gen) echo megadrive ;; pce) echo pcengine ;; vb) echo virtualboy ;;
-    ngp|ngc) echo ngpc ;; ws|wsc) echo wonderswancolor ;;
-    gg) echo gamegear ;; sms) echo mastersystem ;;
-    *) return 1 ;;
-  esac
-}
+def cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nova-push",
+        usage="%(prog)s [options] [system] file ...\n"
+        "       %(prog)s [--host [user@]host] --list\n"
+        "       %(prog)s --set-host [user@]host",
+        description="Copy files into /storage/roms/<system>/ on a PortareOS device. "
+        "ISO/CUE/GDI disc images are converted to verified CHDs first. "
+        "Cartridge ROMs are copied unchanged; other disc formats are rejected.",
+        epilog="Omit the system only when every file extension identifies the same system. "
+        "Host priority: --host, then NOVA, then the saved default in "
+        "${XDG_CONFIG_HOME:-$HOME/.config}/nova-push/host. "
+        "Requires Python 3.10+, SSH, and rsync locally, and rsync on the device. "
+        "Conversion also requires chdman (and FFmpeg for encoded CUE audio). "
+        "Use an SSH config alias for custom ports, keys, or IPv6 addresses.",
+    )
+    parser.add_argument("-H", "--host", help="SSH destination for this command")
+    parser.add_argument(
+        "--set-host", metavar="HOST", help="save a default SSH destination"
+    )
+    parser.add_argument(
+        "-m",
+        "--move",
+        action="store_true",
+        help="remove local inputs after confirmed delivery",
+    )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="preview conversions and transfers without changing files",
+    )
+    parser.add_argument(
+        "--iso-type",
+        type=str.lower,
+        choices=("auto", "cd", "dvd"),
+        help="ISO media type (default: auto; detects PS2 CD/DVD)",
+    )
+    parser.add_argument(
+        "-l", "--list", action="store_true", help="list the device's system folders"
+    )
+    parser.add_argument("inputs", nargs="*", metavar="system/file")
+    return parser
 
-host=${NOVA:-}
-host_option=false
-save_host=false
-move=false
-dry_run=false
-list=false
-iso_type=auto
-iso_type_option=false
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -H|--host)
-      [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a host"
-      host=$2
-      host_option=true
-      shift 2
-      ;;
-    --set-host)
-      [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a host"
-      host=$2
-      save_host=true
-      shift 2
-      ;;
-    --iso-type)
-      [[ $# -ge 2 ]] || fail "$1 requires auto, cd, or dvd"
-      case "$2" in
-        auto) iso_type=auto ;;
-        cd) iso_type=cd ;;
-        dvd) iso_type=dvd ;;
-        *) fail "$1 requires auto, cd, or dvd" ;;
-      esac
-      iso_type_option=true
-      shift 2
-      ;;
-    -m|--move) move=true; shift ;;
-    -n|--dry-run) dry_run=true; shift ;;
-    -l|--list) list=true; shift ;;
-    -h|--help) usage; exit 0 ;;
-    --) shift; break ;;
-    -*) fail "unknown option: $1 (see --help)" ;;
-    *) break ;;
-  esac
-done
 
-if $save_host; then
-  [[ $# -eq 0 ]] && ! $host_option && ! $list && ! $move && ! $dry_run && ! $iso_type_option || fail "--set-host must be used on its own"
-elif ! $list && [[ $# -eq 0 ]]; then
-  usage >&2
-  exit 2
-fi
+def host_config() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        home = os.environ.get("HOME")
+        if not home:
+            raise UsageError("set HOME or XDG_CONFIG_HOME to locate the saved host")
+        config_home = str(Path(home) / ".config")
+    if not Path(config_home).is_absolute():
+        raise UsageError("XDG_CONFIG_HOME must be an absolute path")
+    return Path(config_home) / "nova-push" / "host"
 
-if $save_host || [[ -z $host ]]; then
-  config_home=${XDG_CONFIG_HOME:-}
-  if [[ -z $config_home ]]; then
-    [[ -n ${HOME:-} ]] || fail "set HOME or XDG_CONFIG_HOME to locate the saved host"
-    config_home=$HOME/.config
-  fi
-  [[ $config_home == /* ]] || fail "XDG_CONFIG_HOME must be an absolute path"
-  config_dir=$config_home/nova-push
-  config_file=$config_dir/host
-  if ! $save_host && [[ -f $config_file ]]; then
-    host=$(cat -- "$config_file")
-  fi
-fi
-[[ -n $host ]] || fail "run nova-push --set-host [user@]host, set NOVA, or pass --host [user@]host"
-host_pattern='^([a-zA-Z0-9_][a-zA-Z0-9_.-]*@)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*$'
-[[ $host =~ $host_pattern ]] || fail "invalid host; use [user@]hostname or an SSH config alias"
 
-if $save_host; then
-  umask 077
-  mkdir -p -- "$config_dir"
-  temporary=$(mktemp "$config_dir/.host.XXXXXX")
-  trap 'rm -f -- "$temporary"' EXIT
-  printf '%s\n' "$host" > "$temporary"
-  mv -f -- "$temporary" "$config_file"
-  trap - EXIT
-  echo "nova-push: saved default host $host in $config_file"
-  exit 0
-fi
+def resolve_host(args: argparse.Namespace) -> str:
+    if args.host == "" or args.set_host == "":
+        raise UsageError("--host and --set-host require a host")
+    host = (
+        args.set_host
+        if args.set_host is not None
+        else args.host or os.environ.get("NOVA", "")
+    )
+    if not host:
+        config = host_config()
+        if config.is_file():
+            host = config.read_text().rstrip("\n")
+    if not host:
+        raise UsageError(
+            "run nova-push --set-host [user@]host, set NOVA, or pass --host [user@]host"
+        )
+    if not re.fullmatch(
+        r"([a-zA-Z0-9_][a-zA-Z0-9_.-]*@)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*", host
+    ):
+        raise UsageError("invalid host; use [user@]hostname or an SSH config alias")
+    return host
 
-if $list; then
-  [[ $# -eq 0 ]] && ! $move && ! $dry_run && ! $iso_type_option || fail "--list cannot be combined with files, --move, --dry-run, or --iso-type"
-  command -v ssh >/dev/null || fail "ssh is required"
-  exec ssh "$host" 'ls -1 /storage/roms'
-fi
 
-infer=false
-if [[ -f $1 ]]; then
-  infer=true
-  system=$(infer_system "$1") || fail "ambiguous extension: $1; specify a system (nova-push <system> <files...>)"
-else
-  system=$1
-  shift
-fi
-[[ $system =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail "invalid system folder: $system"
-[[ $# -gt 0 ]] || fail "no files supplied"
+def save_host(host: str) -> None:
+    config = host_config()
+    config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".host.", dir=config.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            output.write(host + "\n")
+        os.replace(temporary, config)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print(f"nova-push: saved default host {host} in {config}")
 
-files=()
-for source in "$@"; do
-  [[ -f $source && ! -L $source ]] || fail "expected a regular file (not a symlink): $source"
-  if $infer; then
-    inferred=$(infer_system "$source") || fail "ambiguous extension: $source; specify a system"
-    [[ $inferred == "$system" ]] || fail "files identify different systems; specify a system or transfer separately"
-  fi
-  if [[ ${#files[@]} -gt 0 ]]; then
-    for previous in "${files[@]}"; do
-      [[ ${source##*/} != "${previous##*/}" ]] || fail "duplicate destination filename: ${source##*/}"
-    done
-  fi
-  # Absolute paths keep colons and leading dashes out of rsync's option/host syntax.
-  if [[ $source != /* ]]; then
-    source=$PWD/$source
-  fi
-  files+=("$source")
-done
 
-for tool in python3 ssh rsync; do
-  command -v "$tool" >/dev/null || fail "$tool is required"
-done
+def infer_system(source: Path) -> str:
+    system = INFERRED_SYSTEMS.get(source.suffix.lower().lstrip("."))
+    if system is None:
+        raise UsageError(
+            f"ambiguous extension: {source}; specify a system (nova-push <system> <files...>)"
+        )
+    return system
 
-# Resolve symlinks so a nova-push link on PATH still finds its Python modules.
-script=${BASH_SOURCE[0]}
-while [[ -L $script ]]; do
-  script_dir=$(cd -P -- "$(dirname -- "$script")" && pwd)
-  script=$(readlink -- "$script")
-  [[ $script == /* ]] || script=$script_dir/$script
-done
-script_dir=$(cd -P -- "$(dirname -- "$script")" && pwd)
-exec python3 "$script_dir/nova_push.py" --iso-type "$iso_type" "$host" "$system" "$move" "$dry_run" "${files[@]}"
+
+def prepare_inputs(inputs: list[str]) -> tuple[str, list[Path]]:
+    infer = Path(inputs[0]).is_file()
+    system = infer_system(Path(inputs[0])) if infer else inputs[0]
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", system):
+        raise UsageError(f"invalid system folder: {system}")
+    arguments = inputs if infer else inputs[1:]
+    if not arguments:
+        raise UsageError("no files supplied")
+    sources = []
+    names = set()
+    for argument in arguments:
+        source = Path(argument)
+        if not source.is_file() or source.is_symlink():
+            raise UsageError(f"expected a regular file (not a symlink): {source}")
+        if infer and infer_system(source) != system:
+            raise UsageError(
+                "files identify different systems; specify a system or transfer separately"
+            )
+        if source.name.casefold() in names:
+            raise UsageError(f"duplicate destination filename: {source.name}")
+        names.add(source.name.casefold())
+        # Absolute paths avoid rsync's option/remote-host syntax for local files.
+        sources.append(source.absolute())
+    return system, sources
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = cli_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.set_host is not None:
+            if (
+                args.inputs
+                or args.host is not None
+                or args.list
+                or args.move
+                or args.dry_run
+                or args.iso_type is not None
+            ):
+                raise UsageError("--set-host must be used on its own")
+        elif args.list:
+            if args.inputs or args.move or args.dry_run or args.iso_type is not None:
+                raise UsageError(
+                    "--list cannot be combined with files, --move, --dry-run, or --iso-type"
+                )
+        elif not args.inputs:
+            parser.print_usage(sys.stderr)
+            return 2
+        host = resolve_host(args)
+        if args.set_host is not None:
+            save_host(host)
+            return 0
+        if args.list:
+            if not shutil.which("ssh"):
+                raise UsageError("ssh is required")
+            return subprocess.run(
+                ["ssh", host, "ls -1 /storage/roms"], check=False
+            ).returncode
+        system, sources = prepare_inputs(args.inputs)
+        for tool in ("ssh", "rsync"):
+            if not shutil.which(tool):
+                raise UsageError(f"{tool} is required")
+        with tempfile.TemporaryDirectory(prefix="nova-push-") as temporary:
+            try:
+                transfers = plan_transfers(system, sources, Path(temporary))
+            except ConversionError as error:
+                raise UsageError(str(error)) from error
+            return push(
+                host,
+                system,
+                transfers,
+                move=args.move,
+                dry_run=args.dry_run,
+                iso_type=args.iso_type or "auto",
+            )
+    except UsageError as error:
+        parser.error(str(error))
+    except (ConversionError, OSError, UnicodeError) as error:
+        print(f"nova-push: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nnova-push: interrupted; temporary CHDs removed.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

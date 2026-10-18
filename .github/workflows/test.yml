@@ -22,6 +22,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install rom-tools ffmpeg rsync
       - name: Check transfer script syntax
-        run: bash -n nova-push
+        run: python3 -m py_compile nova-push
       - name: Run unit and integration tests
         run: python3 -m unittest discover -s tests -v

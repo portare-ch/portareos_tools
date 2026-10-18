@@ -10,7 +10,6 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "nova-push"
 RSYNC = shutil.which("rsync")
 CHDMAN = shutil.which("chdman")
-BASH = os.environ.get("NOVA_TEST_BASH", "/bin/bash")
 
 
 def ps2_iso_data(root_size=300):
@@ -77,6 +76,9 @@ class TransferTestCase(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        # Exercise an isolated, executable copy with no repository helpers.
+        self.script = self.bin / "nova-push"
+        shutil.copy2(SCRIPT, self.script)
         self.log = self.root / "calls.jsonl"
         self.config_home = self.root / "config"
         self.config_file = self.config_home / "nova-push" / "host"
@@ -114,7 +116,7 @@ class TransferTestCase(unittest.TestCase):
 
     def invoke(self, *arguments, **environment):
         return subprocess.run(
-            [BASH, str(SCRIPT), *map(str, arguments)],
+            [str(self.script), *map(str, arguments)],
             cwd=self.root,
             env={**self.environment, **environment},
             capture_output=True,
@@ -139,7 +141,7 @@ class NovaPushTests(TransferTestCase):
     def test_help_and_no_arguments_do_not_need_a_host(self):
         result = self.invoke("--help", NOVA="")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Usage:", result.stdout)
+        self.assertIn("usage:", result.stdout)
         self.assertIn("--dry-run", result.stdout)
         self.assert_invalid(NOVA="")
 

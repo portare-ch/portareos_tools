@@ -3,8 +3,8 @@
 Command-line tools for preparing CHD disc images and transferring games to
 PortareOS. Both run locally on macOS and Linux, without installing this
 repository or any Python packages. Both require Python 3.10 or newer;
-`nova-push` also requires Bash, SSH, and rsync. Keep `nova-push`, `nova_push.py`,
-and `portare_chd.py` together.
+`nova-push` also requires SSH and rsync. It is a standalone executable: copy
+the single `nova-push` file anywhere on your PATH; no helper scripts are needed.
 
 ## Dependencies
 
@@ -127,8 +127,8 @@ running them, and previews rsync's work for existing CHDs and cartridge ROMs.
 Use an SSH config alias for custom ports, identity files, or IPv6 addresses.
 
 Disc transfers only upload CHDs. ISO, CUE, and GDI inputs are converted into a
-temporary folder using `portare_chd.py`, then verified before any files are
-uploaded. Existing CHDs are uploaded unchanged. Cartridge systems such as NES,
+temporary folder using the built-in converter, then verified before any files
+are uploaded. Existing CHDs are uploaded unchanged. Cartridge systems such as NES,
 SNES, Game Boy, GBA, N64, and Mega Drive keep their ROM formats, including
 BIN/ROM and ZIP/7z cartridge archives. Other non-CHD formats are rejected;
 disc archives must be extracted first, and BIN/audio tracks require their CUE.
