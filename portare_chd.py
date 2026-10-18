@@ -121,7 +121,11 @@ def plan_jobs(inputs: list[Path], output: Path | None, recursive: bool) -> list[
             except (ConversionError, OSError):
                 continue  # Report a broken disc when its conversion is attempted.
             referenced.update(entry.source for entry in files)
-    planned = [job for job in jobs.values() if job.source not in referenced]
+    planned = [
+        Job(job.source, job.output.with_name(job.output.name.replace(" ", "_")))
+        for job in jobs.values()
+        if job.source not in referenced
+    ]
     if not planned:
         raise ConversionError(
             "No .cue, .gdi or .iso images found. Use --recursive to search subfolders."

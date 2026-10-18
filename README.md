@@ -69,7 +69,9 @@ are copied where symbolic links or hard links are unavailable.
 
 Without `-o`, CHDs are written beside their source CUE/GDI/ISO. With `-o`,
 file inputs go directly into that folder; folder inputs retain paths relative
-to the selected folder. Conflicting output names are reported before any
+to the selected folder. Spaces in output filenames are replaced with underscores
+(for example, `Metal Slug.cue` becomes `Metal_Slug.chd`). Conflicting output
+names, including those caused by replacing spaces, are reported before any
 conversion. A batch continues after a failed disc and exits with status 1 if
 any disc failed (0 on success, 2 for invalid arguments, 130 for Ctrl+C).
 

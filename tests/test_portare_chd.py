@@ -43,26 +43,26 @@ class WorkspaceTest(unittest.TestCase):
 
 class PlanningTests(WorkspaceTest):
     def test_folder_uses_cue_instead_of_its_iso_and_deduplicates_inputs(self):
-        self.file("Game.iso")
-        cue = self.cue()
+        self.file("Game Disc.iso")
+        cue = self.cue("Game Disc.cue", "Game Disc.iso")
         jobs = chd.plan_jobs([self.root, cue], None, False)
-        self.assertEqual(jobs, [chd.Job(cue, self.root / "Game.chd")])
+        self.assertEqual(jobs, [chd.Job(cue, self.root / "Game_Disc.chd")])
 
     def test_recursive_output_preserves_subfolders(self):
-        first = self.file("discs/a/Game.ISO")
-        second = self.file("discs/b/Game.iso")
+        first = self.file("discs/a folder/Game Name.ISO")
+        second = self.file("discs/b/Game  Name.iso")
         output = self.root / "converted"
         self.assertEqual(
             chd.plan_jobs([self.root / "discs"], output, True),
             [
-                chd.Job(first, output / "a/Game.chd"),
-                chd.Job(second, output / "b/Game.chd"),
+                chd.Job(first, output / "a folder/Game_Name.chd"),
+                chd.Job(second, output / "b/Game__Name.chd"),
             ],
         )
 
     def test_flat_output_collision_is_reported_before_conversion(self):
-        first = self.file("a/Game.iso")
-        second = self.file("b/game.iso")
+        first = self.file("a/Game Disc.iso")
+        second = self.file("b/game_disc.iso")
         with self.assertRaisesRegex(chd.ConversionError, "Output collision"):
             chd.plan_jobs([first, second], self.root / "out", False)
 
@@ -289,7 +289,7 @@ class IntegrationTests(WorkspaceTest):
             "2",
             *options,
         )
-        return self.root / "out" / image.with_suffix(".chd").name
+        return self.root / "out" / image.with_suffix(".chd").name.replace(" ", "_")
 
     def test_dvd_iso_round_trip(self):
         data = bytes(range(256)) * 256
