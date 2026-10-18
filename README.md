@@ -2,8 +2,9 @@
 
 Command-line tools for preparing CHD disc images and transferring games to
 PortareOS. Both run locally on macOS and Linux, without installing this
-repository or any Python packages. The converter requires Python 3.10 or newer;
-`nova-push` requires Bash, SSH, and rsync.
+repository or any Python packages. Both require Python 3.10 or newer;
+`nova-push` also requires Bash, SSH, and rsync. Keep `nova-push`, `nova_push.py`,
+and `portare_chd.py` together.
 
 ## Dependencies
 
@@ -94,6 +95,15 @@ built-in address or user.
 ./nova-push ps2 ./converted/Game.chd
 ./nova-push snes "Game One.sfc" "Game Two.sfc"
 
+# Disc images are converted to CHD and verified before upload.
+./nova-push ps2 "Game.iso"
+./nova-push psx "Game.cue"
+./nova-push dreamcast "Game.gdi"
+./nova-push neogeocd "Metal Slug.cue"
+
+# PS2 CD and DVD ISOs are detected automatically, including in a single batch.
+./nova-push ps2 "CD Game.iso" "DVD Game.iso"
+
 # The system can be omitted for extensions such as .sfc, .nes, .gba, and .nds.
 ./nova-push "Game.sfc"
 
@@ -112,21 +122,49 @@ the saved default. The saved file contains only the SSH destination; keys and
 passwords use your normal SSH setup.
 
 Options go before the system and filenames. A dry run still connects to the
-device to check the destination and preview rsync's work. Use an SSH config
-alias for custom ports, identity files, or IPv6 addresses.
+device to check the destination. It reports planned CHD conversions without
+running them, and previews rsync's work for existing CHDs and cartridge ROMs.
+Use an SSH config alias for custom ports, identity files, or IPv6 addresses.
 
-Specify the system for shared formats such as CHD, ISO, BIN, CUE, PBP, CSO,
-RVZ, GCZ, and ZIP. Inferred files must all belong to the same system. Only the
-files you name are transferred: include companion tracks when copying a CUE
-or GDI disc. Directories, symlinks, and filenames that would collide at the
-destination are rejected. Existing remote files may be replaced; other games
-are kept. File contents and modification times are copied without preserving
-local ownership or permissions.
+Disc transfers only upload CHDs. ISO, CUE, and GDI inputs are converted into a
+temporary folder using `portare_chd.py`, then verified before any files are
+uploaded. Existing CHDs are uploaded unchanged. Cartridge systems such as NES,
+SNES, Game Boy, GBA, N64, and Mega Drive keep their ROM formats, including
+BIN/ROM and ZIP/7z cartridge archives. Other non-CHD formats are rejected;
+disc archives must be extracted first, and BIN/audio tracks require their CUE.
+
+Automatic conversion supports `psx` (SwanStation), `ps2` (ARMSX2), `psp`,
+`dreamcast` (Flycast), `neogeocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
+`tg16cd`, `pcfx`, `3do`, and `cdi`. By default (`--iso-type auto`), PS2/ARMSX2
+ISOs are probed individually to select `chdman createcd` or `chdman createdvd`.
+Detection follows the [PCSX2 media detection heuristic](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp):
+images beyond CD capacity use DVD mode; smaller images use the ISO9660 volume
+descriptor's root directory length. A small DVD image can still use DVD mode.
+Unrecognized PS2 ISO metadata stops the batch before conversion or upload.
+`--iso-type cd` or `--iso-type dvd` can override detection for unusual images.
+Other CD systems use `createcd`, and PSP uses `createdvd`. CUE and GDI always
+use `createcd`, regardless of the ISO option. Each conversion and dry run shows
+the selected command. Converted filenames replace spaces with underscores.
+Local CHDs beside the inputs are left untouched; temporary CHDs are removed
+after the command finishes, including on failure.
+
+Specify the system for shared formats such as CHD, ISO, CUE, GDI, BIN, and ZIP.
+Inferred files must all belong to the same system. For CUE/GDI discs, name
+only the descriptor; its companion tracks are read locally during conversion.
+An ISO referenced by a selected CUE is excluded as a separate conversion.
+Directories, symlinks, and filenames that would collide after conversion are
+rejected. Existing remote files may be replaced; other games are kept. File
+contents and modification times are copied without preserving local ownership
+or permissions.
 
 Interrupted transfers keep resumable data in `.nova-push-partial` on the device.
 `--move` uses rsync checksums to compare existing remote content before removing
-each delivered source. A failed batch can leave some files already transferred
-and, with `--move`, removed locally. Keep source files unchanged during a move.
+each delivered source. For converted inputs, `--move` removes the named source
+image or descriptor only after the transfer succeeds and rsync has removed
+the temporary CHD. Companion tracks are kept. If conversion or transfer fails,
+original conversion inputs are kept. A failed batch can leave some files
+already transferred and existing CHDs or cartridge ROMs removed locally with
+`--move`. Keep source files unchanged during a move.
 See the [rsync documentation](https://download.samba.org/pub/rsync/rsync.1) for
 transfer and source-removal behavior. Run `./nova-push --help` for usage.
 

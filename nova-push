@@ -11,12 +11,15 @@ Usage: nova-push [options] [system] file ...
 
 Copy files into /storage/roms/<system>/ on a PortareOS device.
 Omit the system only when every file extension identifies the same system.
+Disc images must be CHD: ISO/CUE/GDI inputs are converted and verified first.
+Cartridge ROMs are copied unchanged; other disc formats are rejected.
 
 Options (before the system and files):
   -H, --host HOST       SSH destination for this command
       --set-host HOST   Save a default destination for future commands
   -m, --move            Remove each local file after rsync confirms delivery
   -n, --dry-run         Preview the transfer without copying or removing files
+      --iso-type TYPE   ISO media type: auto (detect PS2 CD/DVD), cd, or dvd
   -l, --list            List the device's system folders
   -h, --help            Show this help
   --                   End options (for filenames beginning with a dash)
@@ -24,12 +27,14 @@ Options (before the system and files):
 Examples:
   nova-push --set-host root@device
   nova-push ps2 game.chd
+  nova-push ps2 cd-game.iso
   nova-push game.sfc
   nova-push --host device --dry-run --move psp game.iso
 
 Host priority: --host, then NOVA, then the saved default.
 The default is stored in ${XDG_CONFIG_HOME:-$HOME/.config}/nova-push/host.
-Requires Bash, SSH, and rsync locally, and rsync on the device.
+Requires Bash, Python 3.10+, SSH, and rsync locally, and rsync on the device.
+Conversion also requires chdman (and FFmpeg for encoded CUE audio).
 Use an SSH config alias for custom ports, keys, or IPv6 addresses.
 EOF
 }
@@ -56,6 +61,8 @@ save_host=false
 move=false
 dry_run=false
 list=false
+iso_type=auto
+iso_type_option=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -H|--host)
@@ -70,6 +77,17 @@ while [[ $# -gt 0 ]]; do
       save_host=true
       shift 2
       ;;
+    --iso-type)
+      [[ $# -ge 2 ]] || fail "$1 requires auto, cd, or dvd"
+      case "$2" in
+        auto) iso_type=auto ;;
+        cd) iso_type=cd ;;
+        dvd) iso_type=dvd ;;
+        *) fail "$1 requires auto, cd, or dvd" ;;
+      esac
+      iso_type_option=true
+      shift 2
+      ;;
     -m|--move) move=true; shift ;;
     -n|--dry-run) dry_run=true; shift ;;
     -l|--list) list=true; shift ;;
@@ -81,7 +99,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if $save_host; then
-  [[ $# -eq 0 ]] && ! $host_option && ! $list && ! $move && ! $dry_run || fail "--set-host must be used on its own"
+  [[ $# -eq 0 ]] && ! $host_option && ! $list && ! $move && ! $dry_run && ! $iso_type_option || fail "--set-host must be used on its own"
 elif ! $list && [[ $# -eq 0 ]]; then
   usage >&2
   exit 2
@@ -117,7 +135,7 @@ if $save_host; then
 fi
 
 if $list; then
-  [[ $# -eq 0 ]] && ! $move && ! $dry_run || fail "--list cannot be combined with files, --move, or --dry-run"
+  [[ $# -eq 0 ]] && ! $move && ! $dry_run && ! $iso_type_option || fail "--list cannot be combined with files, --move, --dry-run, or --iso-type"
   command -v ssh >/dev/null || fail "ssh is required"
   exec ssh "$host" 'ls -1 /storage/roms'
 fi
@@ -152,31 +170,16 @@ for source in "$@"; do
   files+=("$source")
 done
 
-for tool in ssh rsync; do
+for tool in python3 ssh rsync; do
   command -v "$tool" >/dev/null || fail "$tool is required"
 done
 
-destination=/storage/roms/$system/
-if ! ssh "$host" "test -d $destination"; then
-  echo "nova-push: cannot access $host:$destination; check SSH and use --list to see system folders" >&2
-  exit 1
-fi
-
-options=(-th --progress --partial-dir=.nova-push-partial --rsh=ssh)
-if $move; then
-  # Check existing destination content too, before allowing source removal.
-  options+=(--checksum --remove-source-files)
-fi
-if $dry_run; then
-  options+=(--dry-run)
-fi
-rsync "${options[@]}" -- "${files[@]}" "$host:$destination"
-
-if $dry_run; then
-  action='dry run; no files copied or removed'
-elif $move; then
-  action='moved'
-else
-  action='copied'
-fi
-echo "nova-push: ${#files[@]} file(s) -> $host:$destination ($action)"
+# Resolve symlinks so a nova-push link on PATH still finds its Python modules.
+script=${BASH_SOURCE[0]}
+while [[ -L $script ]]; do
+  script_dir=$(cd -P -- "$(dirname -- "$script")" && pwd)
+  script=$(readlink -- "$script")
+  [[ $script == /* ]] || script=$script_dir/$script
+done
+script_dir=$(cd -P -- "$(dirname -- "$script")" && pwd)
+exec python3 "$script_dir/nova_push.py" --iso-type "$iso_type" "$host" "$system" "$move" "$dry_run" "${files[@]}"
