@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Copy or move ROM files to a PortareOS device over SSH.
+set -euo pipefail
+shopt -s nocasematch
+
+usage() {
+  cat <<'EOF'
+Usage: nova-push [options] [system] file ...
+       nova-push [--host [user@]host] --list
+       nova-push --set-host [user@]host
+
+Copy files into /storage/roms/<system>/ on a PortareOS device.
+Omit the system only when every file extension identifies the same system.
+
+Options (before the system and files):
+  -H, --host HOST       SSH destination for this command
+      --set-host HOST   Save a default destination for future commands
+  -m, --move            Remove each local file after rsync confirms delivery
+  -n, --dry-run         Preview the transfer without copying or removing files
+  -l, --list            List the device's system folders
+  -h, --help            Show this help
+  --                   End options (for filenames beginning with a dash)
+
+Examples:
+  nova-push --set-host root@device
+  nova-push ps2 game.chd
+  nova-push game.sfc
+  nova-push --host device --dry-run --move psp game.iso
+
+Host priority: --host, then NOVA, then the saved default.
+The default is stored in ${XDG_CONFIG_HOME:-$HOME/.config}/nova-push/host.
+Requires Bash, SSH, and rsync locally, and rsync on the device.
+Use an SSH config alias for custom ports, keys, or IPv6 addresses.
+EOF
+}
+
+fail() {
+  echo "nova-push: $*" >&2
+  exit 2
+}
+
+infer_system() {
+  case "${1##*.}" in
+    nes) echo nes ;; sfc|smc) echo snes ;; gb) echo gb ;; gbc) echo gbc ;;
+    gba) echo gba ;; z64|n64|v64) echo n64 ;; nds) echo nds ;;
+    md|gen) echo megadrive ;; pce) echo pcengine ;; vb) echo virtualboy ;;
+    ngp|ngc) echo ngpc ;; ws|wsc) echo wonderswancolor ;;
+    gg) echo gamegear ;; sms) echo mastersystem ;;
+    *) return 1 ;;
+  esac
+}
+
+host=${NOVA:-}
+host_option=false
+save_host=false
+move=false
+dry_run=false
+list=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -H|--host)
+      [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a host"
+      host=$2
+      host_option=true
+      shift 2
+      ;;
+    --set-host)
+      [[ $# -ge 2 && -n $2 ]] || fail "$1 requires a host"
+      host=$2
+      save_host=true
+      shift 2
+      ;;
+    -m|--move) move=true; shift ;;
+    -n|--dry-run) dry_run=true; shift ;;
+    -l|--list) list=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) fail "unknown option: $1 (see --help)" ;;
+    *) break ;;
+  esac
+done
+
+if $save_host; then
+  [[ $# -eq 0 ]] && ! $host_option && ! $list && ! $move && ! $dry_run || fail "--set-host must be used on its own"
+elif ! $list && [[ $# -eq 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
+if $save_host || [[ -z $host ]]; then
+  config_home=${XDG_CONFIG_HOME:-}
+  if [[ -z $config_home ]]; then
+    [[ -n ${HOME:-} ]] || fail "set HOME or XDG_CONFIG_HOME to locate the saved host"
+    config_home=$HOME/.config
+  fi
+  [[ $config_home == /* ]] || fail "XDG_CONFIG_HOME must be an absolute path"
+  config_dir=$config_home/nova-push
+  config_file=$config_dir/host
+  if ! $save_host && [[ -f $config_file ]]; then
+    host=$(cat -- "$config_file")
+  fi
+fi
+[[ -n $host ]] || fail "run nova-push --set-host [user@]host, set NOVA, or pass --host [user@]host"
+host_pattern='^([a-zA-Z0-9_][a-zA-Z0-9_.-]*@)?[a-zA-Z0-9_][a-zA-Z0-9_.-]*$'
+[[ $host =~ $host_pattern ]] || fail "invalid host; use [user@]hostname or an SSH config alias"
+
+if $save_host; then
+  umask 077
+  mkdir -p -- "$config_dir"
+  temporary=$(mktemp "$config_dir/.host.XXXXXX")
+  trap 'rm -f -- "$temporary"' EXIT
+  printf '%s\n' "$host" > "$temporary"
+  mv -f -- "$temporary" "$config_file"
+  trap - EXIT
+  echo "nova-push: saved default host $host in $config_file"
+  exit 0
+fi
+
+if $list; then
+  [[ $# -eq 0 ]] && ! $move && ! $dry_run || fail "--list cannot be combined with files, --move, or --dry-run"
+  command -v ssh >/dev/null || fail "ssh is required"
+  exec ssh "$host" 'ls -1 /storage/roms'
+fi
+
+infer=false
+if [[ -f $1 ]]; then
+  infer=true
+  system=$(infer_system "$1") || fail "ambiguous extension: $1; specify a system (nova-push <system> <files...>)"
+else
+  system=$1
+  shift
+fi
+[[ $system =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail "invalid system folder: $system"
+[[ $# -gt 0 ]] || fail "no files supplied"
+
+files=()
+for source in "$@"; do
+  [[ -f $source && ! -L $source ]] || fail "expected a regular file (not a symlink): $source"
+  if $infer; then
+    inferred=$(infer_system "$source") || fail "ambiguous extension: $source; specify a system"
+    [[ $inferred == "$system" ]] || fail "files identify different systems; specify a system or transfer separately"
+  fi
+  if [[ ${#files[@]} -gt 0 ]]; then
+    for previous in "${files[@]}"; do
+      [[ ${source##*/} != "${previous##*/}" ]] || fail "duplicate destination filename: ${source##*/}"
+    done
+  fi
+  # Absolute paths keep colons and leading dashes out of rsync's option/host syntax.
+  if [[ $source != /* ]]; then
+    source=$PWD/$source
+  fi
+  files+=("$source")
+done
+
+for tool in ssh rsync; do
+  command -v "$tool" >/dev/null || fail "$tool is required"
+done
+
+destination=/storage/roms/$system/
+if ! ssh "$host" "test -d $destination"; then
+  echo "nova-push: cannot access $host:$destination; check SSH and use --list to see system folders" >&2
+  exit 1
+fi
+
+options=(-th --progress --partial-dir=.nova-push-partial --rsh=ssh)
+if $move; then
+  # Check existing destination content too, before allowing source removal.
+  options+=(--checksum --remove-source-files)
+fi
+if $dry_run; then
+  options+=(--dry-run)
+fi
+rsync "${options[@]}" -- "${files[@]}" "$host:$destination"
+
+if $dry_run; then
+  action='dry run; no files copied or removed'
+elif $move; then
+  action='moved'
+else
+  action='copied'
+fi
+echo "nova-push: ${#files[@]} file(s) -> $host:$destination ($action)"

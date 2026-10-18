@@ -1,21 +1,22 @@
 # PortareOS tools
 
-A simple command-line converter for preparing CHD disc images for PortareOS.
-Runs locally on macOS and Linux with Python 3.10 or newer. No Python packages
-or installation of this repository are required.
+Command-line tools for preparing CHD disc images and transferring games to
+PortareOS. Both run locally on macOS and Linux, without installing this
+repository or any Python packages. The converter requires Python 3.10 or newer;
+`nova-push` requires Bash, SSH, and rsync.
 
 ## Dependencies
 
 macOS, using [Homebrew](https://brew.sh/):
 
 ```sh
-brew install python rom-tools ffmpeg
+brew install python rom-tools ffmpeg rsync
 ```
 
 Debian / Ubuntu:
 
 ```sh
-sudo apt install python3 mame-tools ffmpeg
+sudo apt install python3 mame-tools ffmpeg openssh-client rsync
 ```
 
 `chdman` is included in `rom-tools` on Homebrew and `mame-tools` on Debian/Ubuntu.
@@ -78,6 +79,57 @@ any disc failed (0 on success, 2 for invalid arguments, 130 for Ctrl+C).
 Use `-j 4` to limit compression threads or `--no-verify` to skip verification.
 Run `python3 portare_chd.py --help` for all options.
 
+## Transfer to a device
+
+`nova-push` copies files over SSH into an existing `/storage/roms/<system>/`
+folder. SSH access must be enabled and `rsync` must also be installed on the
+device. Save your device once, then use it from any terminal. There is no
+built-in address or user.
+
+```sh
+# Remember the SSH destination for future commands.
+./nova-push --set-host root@device
+
+./nova-push --list
+./nova-push ps2 ./converted/Game.chd
+./nova-push snes "Game One.sfc" "Game Two.sfc"
+
+# The system can be omitted for extensions such as .sfc, .nes, .gba, and .nds.
+./nova-push "Game.sfc"
+
+# Preview a move, then transfer and remove successfully delivered local files.
+./nova-push --dry-run --move ps2 "Game.chd"
+./nova-push --move ps2 "Game.chd"
+
+# Override the saved destination for one command. SSH config aliases also work.
+./nova-push --host my-device psp "Game.iso"
+```
+
+The default is saved in `~/.config/nova-push/host` (or
+`$XDG_CONFIG_HOME/nova-push/host` when set). Run `--set-host` again to change it.
+Host selection uses `--host` first, then the `NOVA` environment variable, then
+the saved default. The saved file contains only the SSH destination; keys and
+passwords use your normal SSH setup.
+
+Options go before the system and filenames. A dry run still connects to the
+device to check the destination and preview rsync's work. Use an SSH config
+alias for custom ports, identity files, or IPv6 addresses.
+
+Specify the system for shared formats such as CHD, ISO, BIN, CUE, PBP, CSO,
+RVZ, GCZ, and ZIP. Inferred files must all belong to the same system. Only the
+files you name are transferred: include companion tracks when copying a CUE
+or GDI disc. Directories, symlinks, and filenames that would collide at the
+destination are rejected. Existing remote files may be replaced; other games
+are kept. File contents and modification times are copied without preserving
+local ownership or permissions.
+
+Interrupted transfers keep resumable data in `.nova-push-partial` on the device.
+`--move` uses rsync checksums to compare existing remote content before removing
+each delivered source. A failed batch can leave some files already transferred
+and, with `--move`, removed locally. Keep source files unchanged during a move.
+See the [rsync documentation](https://download.samba.org/pub/rsync/rsync.1) for
+transfer and source-removal behavior. Run `./nova-push --help` for usage.
+
 ## Checks
 
 ```sh
@@ -85,7 +137,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests include round trips using real `chdman` and FFmpeg when installed;
-those integration tests are skipped when the relevant tools are unavailable.
-No game files are included in this repository.
+they also exercise `nova-push` with a local SSH substitute and real rsync when
+available. Integration tests are skipped when the relevant tools are
+unavailable. Tests never connect to a device, and no game files are included.
 
 CHD commands and options follow the [MAME chdman documentation](https://docs.mamedev.org/tools/chdman.html).

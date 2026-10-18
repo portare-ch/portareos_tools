@@ -1,4 +1,4 @@
-name: Test CHD converter
+name: Test tools
 
 on:
   push:
@@ -17,9 +17,11 @@ jobs:
           python-version: '3.10'
       - name: Install conversion tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mame-tools ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y mame-tools ffmpeg rsync
       - name: Install conversion tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install rom-tools ffmpeg
+        run: brew install rom-tools ffmpeg rsync
+      - name: Check transfer script syntax
+        run: bash -n nova-push
       - name: Run unit and integration tests
         run: python3 -m unittest discover -s tests -v
