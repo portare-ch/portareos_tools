@@ -1,10 +1,51 @@
 # PortareOS tools
 
 Command-line tools for preparing CHD disc images and transferring games to
-PortareOS. Both run locally on macOS and Linux, without installing this
-repository or any Python packages. Both require Python 3.10 or newer;
-`nova-push` also requires SSH and rsync. It is a standalone executable: copy
-the single `nova-push` file anywhere on your PATH; no helper scripts are needed.
+PortareOS. Both run locally on macOS and Linux and require Python 3.10 or newer,
+with no Python packages to install. `nova-push` also requires SSH and rsync.
+Both tools are standalone executables; no repository or helper scripts are
+needed after installation.
+
+## Quick install
+
+On macOS or Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/portare-ch/portareos_tools/main/install.sh | bash
+```
+
+This installs `nova-push` and `portare-chd` into `~/.local/bin`, along with any
+missing dependencies. On macOS, install [Homebrew](https://brew.sh/) first and
+follow its PATH setup instructions. On Linux, automatic dependency installation
+supports Debian/Ubuntu (`apt-get`), Fedora (`dnf`), and Arch (`pacman`); it uses
+`sudo` when needed. Fedora uses its
+[`ffmpeg-free` package](https://packages.fedoraproject.org/pkgs/ffmpeg/ffmpeg-free/).
+Other Linux distributions can install dependencies manually and use `--no-deps`.
+
+If `~/.local/bin` is missing from your PATH, the installer prints the line to
+add to your shell configuration. Then open a new terminal and run:
+
+```sh
+nova-push --set-host root@device
+nova-push --help
+portare-chd --help
+```
+
+From a downloaded or cloned checkout, run `bash install.sh`. To choose another
+location or skip dependency checks and installation:
+
+```sh
+bash install.sh --prefix "$HOME/tools" --no-deps
+
+# The same options work with the one-command installer.
+curl -fsSL https://raw.githubusercontent.com/portare-ch/portareos_tools/main/install.sh | bash -s -- --prefix "$HOME/tools" --no-deps
+```
+
+`--prefix` installs into the specified directory's `bin` subfolder. With
+`--no-deps`, provide Python 3.10+ and the external tools needed for your usage
+yourself. Rerun the installer to update both commands. To uninstall, remove
+`nova-push` and `portare-chd` from the installation's `bin` folder; installed
+dependencies and your saved device configuration are kept.
 
 ## Dependencies
 
@@ -27,7 +68,13 @@ You can also specify executable paths with `--chdman` / `--ffmpeg`, or the
 
 ## Convert
 
-Run from this repository:
+After installation, use `portare-chd`:
+
+```sh
+portare-chd "/path/to/Metal Slug.cue" -o ./converted
+```
+
+You can also run directly from this repository:
 
 ```sh
 # A Neo Geo CD game with an ISO and MP3 tracks: select the CUE or its folder.
@@ -86,6 +133,9 @@ Run `python3 portare_chd.py --help` for all options.
 folder. SSH access must be enabled and `rsync` must also be installed on the
 device. Save your device once, then use it from any terminal. There is no
 built-in address or user.
+
+The examples below run from a checkout. After installation, use `nova-push`
+in place of `./nova-push` from any folder.
 
 ```sh
 # Remember the SSH destination for future commands.
