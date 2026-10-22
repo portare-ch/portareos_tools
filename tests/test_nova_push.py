@@ -83,7 +83,7 @@ class TransferTestCase(unittest.TestCase):
         self.config_home = self.root / "config"
         self.config_file = self.config_home / "nova-push" / "host"
         self.device = self.root / "device"
-        for system in ("psx", "ps2", "psp", "dreamcast", "neogeocd", "snes"):
+        for system in ("psx", "ps2", "psp", "pspminis", "dreamcast", "neocd", "neogeocd", "snes"):
             (self.device / system).mkdir(parents=True)
         for tool in ("ssh", "rsync", "chdman"):
             executable = self.bin / tool
@@ -287,8 +287,10 @@ class NovaPushTests(TransferTestCase):
             ("armsx2", "createdvd"),
             ("dreamcast", "createcd"),
             ("flycast", "createcd"),
+            ("neocd", "createcd"),
             ("neogeocd", "createcd"),
             ("psp", "createdvd"),
+            ("pspminis", "createdvd"),
             ("saturn", "createcd"),
             ("segacd", "createcd"),
             ("pcenginecd", "createcd"),

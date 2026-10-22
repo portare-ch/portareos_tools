@@ -149,7 +149,7 @@ in place of `./nova-push` from any folder.
 ./nova-push ps2 "Game.iso"
 ./nova-push psx "Game.cue"
 ./nova-push dreamcast "Game.gdi"
-./nova-push neogeocd "Metal Slug.cue"
+./nova-push neocd "Metal Slug.cue"
 
 # PS2 CD and DVD ISOs are detected automatically, including in a single batch.
 ./nova-push ps2 "CD Game.iso" "DVD Game.iso"
@@ -183,8 +183,8 @@ SNES, Game Boy, GBA, N64, and Mega Drive keep their ROM formats, including
 BIN/ROM and ZIP/7z cartridge archives. Other non-CHD formats are rejected;
 disc archives must be extracted first, and BIN/audio tracks require their CUE.
 
-Automatic conversion supports `psx` (SwanStation), `ps2` (ARMSX2), `psp`,
-`dreamcast` (Flycast), `neogeocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
+Automatic conversion supports `psx` (SwanStation), `ps2` (ARMSX2), `psp`/`pspminis`,
+`dreamcast` (Flycast), `neocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
 `tg16cd`, `pcfx`, `3do`, and `cdi`. By default (`--iso-type auto`), PS2/ARMSX2
 ISOs are probed individually to select `chdman createcd` or `chdman createdvd`.
 Detection follows the [PCSX2 media detection heuristic](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp):

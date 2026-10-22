@@ -373,6 +373,7 @@ CD_SYSTEMS = {
     "swanstation",
     "dreamcast",
     "flycast",
+    "neocd",
     "neogeocd",
     "segacd",
     "megacd",
@@ -384,7 +385,7 @@ CD_SYSTEMS = {
     "cdi",
 }
 PS2_SYSTEMS = {"ps2", "armsx2"}
-DVD_SYSTEMS = PS2_SYSTEMS | {"psp"}
+DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis"}
 
 
 @dataclass(frozen=True)
