@@ -164,6 +164,10 @@ in place of `./nova-push` from any folder.
 # Override the saved destination for one command. SSH config aliases also work.
 ./nova-push --host my-device psp "Game.iso"
 ./nova-push psp "Game.cso"
+
+# GameCube and Wii images become RVZ (needs dolphin-tool, see below).
+./nova-push gamecube "Game.iso"
+./nova-push wii "Game.rvz"
 ```
 
 The default is saved in `~/.config/nova-push/host` (or
@@ -198,6 +202,18 @@ Unrecognized PS2 ISO metadata stops the batch before conversion or upload.
 Other CD systems use `createcd`, and PSP uses `createdvd`. CUE and GDI always
 use `createcd`, regardless of the ISO option. Each conversion and dry run shows
 the selected command. Converted filenames replace spaces with underscores.
+
+GameCube, Triforce, Wii and WiiWare games are RVZ instead, Dolphin's lossless
+format: it regenerates the discs' pseudo-random padding and stores Wii data
+decrypted, neither of which CHD can compress. RVZ images and `.dol` homebrew
+are copied unchanged, as are `.wad` channels for `wii`/`wiiware`. ISO, GCM,
+GCZ, WBFS, CISO and WIA images are converted with `dolphin-tool convert`
+(Zstandard level 5, 128 KiB blocks, Dolphin's suggested settings) and verified
+by comparing the SHA-1 of the disc the RVZ decodes to with the source's before
+anything is uploaded. `dolphin-tool` comes with Debian/Ubuntu's `dolphin-emu`
+package; Dolphin's macOS app does not include it, so on a Mac convert in
+Dolphin (right-click the game, Convert File..., RVZ) and push the `.rvz`. Set
+`DOLPHIN_TOOL` to use another copy.
 Local CHDs beside the inputs are left untouched; temporary CHDs are removed
 after the command finishes, including on failure.
 
@@ -227,7 +243,7 @@ transfer and source-removal behavior. Run `./nova-push --help` for usage.
 python3 -m unittest discover -s tests -v
 ```
 
-The tests include round trips using real `chdman` and FFmpeg when installed;
+The tests include round trips using real `chdman`, FFmpeg and `dolphin-tool` when installed;
 they also exercise `nova-push` with a local SSH substitute and real rsync when
 available. Integration tests are skipped when the relevant tools are
 unavailable. Tests never connect to a device, and no game files are included.

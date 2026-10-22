@@ -38,6 +38,7 @@ class CueFile:
 class Job:
     source: Path
     output: Path
+    container: str = "chd"
 
 
 def read_cue(source: Path) -> tuple[list[str], list[CueFile]]:
@@ -365,6 +366,73 @@ def convert(job: Job, args: argparse.Namespace, chdman: str) -> bool:
     return True
 
 
+def find_dolphin_tool() -> str:
+    candidates = [os.environ.get("DOLPHIN_TOOL")] if os.environ.get("DOLPHIN_TOOL") else [
+        "dolphin-tool",
+        "/usr/games/dolphin-tool",  # Debian and Ubuntu's dolphin-emu package
+    ]
+    for candidate in candidates:
+        executable = shutil.which(os.path.expanduser(candidate))
+        if executable:
+            return str(Path(executable).resolve())
+    raise ConversionError(
+        "Cannot find dolphin-tool, which converts GameCube and Wii images to RVZ. "
+        "Dolphin's macOS app does not include it: convert in Dolphin instead "
+        "(right-click the game, Convert File..., format RVZ, Zstandard, level 5, "
+        "block size 128 KiB) and push the .rvz. On Debian/Ubuntu: "
+        "sudo apt install dolphin-emu. Or set DOLPHIN_TOOL=/path/to/dolphin-tool."
+    )
+
+
+def disc_sha1(tool: str, image: Path, user: Path) -> str:
+    """SHA-1 of the disc an image decodes to, whatever its container."""
+    result = subprocess.run(
+        [tool, "verify", "-u", str(user), "-i", str(image), "-a", "sha1"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    digest = result.stdout.strip().split()[-1] if result.stdout.strip() else ""
+    if result.returncode or not re.fullmatch(r"[0-9a-f]{40}", digest):
+        raise ConversionError(
+            f"dolphin-tool could not read {image.name}: "
+            f"{(result.stderr or result.stdout).strip()}"
+        )
+    return digest
+
+
+def convert_rvz(job: Job, tool: str) -> bool:
+    if os.path.lexists(job.output):
+        print(f"Skipped existing: {job.output}", flush=True)
+        return False
+    job.output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Converting: {job.source}\n        to: {job.output}", flush=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".portare-rvz-", dir=job.output.parent
+    ) as temporary:
+        work = Path(temporary)
+        # dolphin-tool keeps temporary files in a user folder; not ~/.
+        user = work / "user"
+        staged = work / "output.rvz"
+        run([tool, "convert", "-u", str(user), "-i", str(job.source),
+             "-o", str(staged), *RVZ_OPTIONS])
+        print("  Verifying RVZ…", flush=True)
+        expected = disc_sha1(tool, job.source, user)
+        actual = disc_sha1(tool, staged, user)
+        if actual != expected:
+            raise ConversionError(
+                f"{job.source.name}: RVZ verification failed: the RVZ decodes to "
+                f"SHA-1 {actual}, the source to {expected}"
+            )
+        publish(staged, job.output, False)
+    print(
+        f"Created: {job.output} ({job.output.stat().st_size / (1024 * 1024):.1f} MiB)",
+        flush=True,
+    )
+    return True
+
+
 CARTRIDGE_SYSTEMS = {
     "nes",
     "famicom",
@@ -460,6 +528,14 @@ CD_SYSTEMS = {
     "3do",
     "cdi",
 }
+# GameCube and Wii games are RVZ, Dolphin's lossless format: it regenerates the
+# discs' pseudo-random padding and stores Wii data decrypted, neither of which
+# CHD can compress. dolphin-tool converts the other image formats.
+DOLPHIN_SYSTEMS = {"gamecube", "triforce", "wii", "wiiware"}
+DOLPHIN_IMAGES = {".iso", ".gcm", ".gcz", ".wbfs", ".ciso", ".wia"}
+DOLPHIN_KEEP = {".rvz", ".dol"}  # .dol homebrew has no disc
+WII_CHANNEL_SYSTEMS = {"wii", "wiiware"}  # .wad channels are not discs either
+RVZ_OPTIONS = ["-f", "rvz", "-c", "zstd", "-l", "5", "-b", "131072"]
 PS2_SYSTEMS = {"ps2", "armsx2"}
 DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis", "xbox"}
 
@@ -508,8 +584,31 @@ def media_type(source: Path, system: str, iso_type: str) -> str:
     return "cd" if system.casefold() in CD_SYSTEMS else "dvd"
 
 
+def plan_rvz_transfers(system: str, sources: list[Path], output: Path) -> list[Transfer]:
+    transfers = []
+    for source in sources:
+        extension = source.suffix.lower()
+        if extension in DOLPHIN_KEEP or (
+            extension == ".wad" and system in WII_CHANNEL_SYSTEMS
+        ):
+            transfers.append(Transfer(source, source))
+        elif extension in DOLPHIN_IMAGES:
+            name = source.with_suffix(".rvz").name.replace(" ", "_")
+            job = Job(source, output / name, "rvz")
+            transfers.append(Transfer(source, job.output, job))
+        else:
+            raise ConversionError(
+                f"GameCube and Wii games are RVZ: {source.name}. Supply an .rvz, or an "
+                "ISO/GCM/GCZ/WBFS/CISO/WIA image to convert"
+                + (" (.wad channels are copied as they are)." if system in WII_CHANNEL_SYSTEMS else ".")
+            )
+    return transfers
+
+
 def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Transfer]:
     system = system.casefold()
+    if system in DOLPHIN_SYSTEMS:
+        return check_names(plan_rvz_transfers(system, sources, output))
     images = []
     passthrough = []
     for source in sources:
@@ -538,6 +637,10 @@ def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Trans
     transfers = [
         planned[source.resolve()] for source in sources if source.resolve() in planned
     ]
+    return check_names(transfers)
+
+
+def check_names(transfers: list[Transfer]) -> list[Transfer]:
     names = set()
     for item in transfers:
         name = item.upload.name.casefold()
@@ -560,9 +663,13 @@ def push(
     conversions = [
         (item, media_type(item.source, system, iso_type))
         for item in transfers
-        if item.conversion
+        if item.conversion and item.conversion.container == "chd"
+    ]
+    rvz_conversions = [
+        item for item in transfers if item.conversion and item.conversion.container == "rvz"
     ]
     chdman = find_tool("chdman", None) if conversions and not dry_run else None
+    dolphin_tool = find_dolphin_tool() if rvz_conversions and not dry_run else None
     destination = f"/storage/roms/{system}/"
     if subprocess.run(["ssh", host, f"test -d {destination}"], check=False).returncode:
         print(
@@ -592,6 +699,17 @@ def push(
                 overwrite=False,
             )
             convert(item.conversion, args, chdman)
+
+    for item in rvz_conversions:
+        if dry_run:
+            print(
+                f"nova-push: would convert and verify {item.source} "
+                f"-> {host}:{destination}{item.upload.name} (dolphin-tool convert to RVZ)",
+                flush=True,
+            )
+        else:
+            print(f"nova-push: {item.source.name}: using dolphin-tool convert to RVZ", flush=True)
+            convert_rvz(item.conversion, dolphin_tool)
 
     # A dry run previews future CHDs above; rsync needs actual source files.
     uploads = [item for item in transfers if not (dry_run and item.conversion)]
@@ -666,7 +784,7 @@ def cli_parser() -> argparse.ArgumentParser:
         "       %(prog)s --set-host [user@]host",
         description="Copy files into /storage/roms/<system>/ on a PortareOS device. "
         "ISO/CUE/GDI disc images, and CSO for PS2, PSP and Xbox, are converted to "
-        "verified CHDs first. "
+        "verified CHDs first; GameCube and Wii images to verified RVZ with dolphin-tool. "
         "Cartridge ROMs are copied unchanged; other disc formats are rejected.",
         epilog="Omit the system only when every file extension identifies the same system. "
         "Host priority: --host, then NOVA, then the saved default in "
