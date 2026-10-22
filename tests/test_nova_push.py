@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "nova-push"
 RSYNC = shutil.which("rsync")
 CHDMAN = shutil.which("chdman")
+DOLPHIN_TOOL = shutil.which("dolphin-tool") or shutil.which("/usr/games/dolphin-tool")
 
 
 def ps2_iso_data(root_size=300):
@@ -74,6 +76,14 @@ with open(os.environ["NOVA_TEST_LOG"], "a") as log:
 status = int(os.environ.get("NOVA_TEST_" + tool.upper() + "_STATUS", "0"))
 if status:
     sys.exit(status)
+if tool == "dolphin-tool":
+    if args[0] == "convert":
+        Path(args[args.index("-o") + 1]).write_bytes(b"converted RVZ")
+        sys.exit(0)
+    image = args[args.index("-i") + 1]
+    mismatch = os.environ.get("NOVA_TEST_RVZ_MISMATCH") and image.endswith(".rvz")
+    print("1" * 40 if mismatch else "0" * 40)
+    sys.exit(0)
 if tool == "chdman":
     if args[0] == "verify":
         sys.exit(int(os.environ.get("NOVA_TEST_VERIFY_STATUS", "0")))
@@ -114,10 +124,11 @@ class TransferTestCase(unittest.TestCase):
         self.config_file = self.config_home / "nova-push" / "host"
         self.device = self.root / "device"
         for system in (
-            "psx", "ps2", "psp", "pspminis", "xbox", "dreamcast", "neocd", "neogeocd", "snes"
+            "psx", "ps2", "psp", "pspminis", "xbox", "dreamcast", "neocd", "neogeocd", "snes",
+            "gamecube", "triforce", "wii", "wiiware",
         ):
             (self.device / system).mkdir(parents=True)
-        for tool in ("ssh", "rsync", "chdman"):
+        for tool in ("ssh", "rsync", "chdman", "dolphin-tool"):
             executable = self.bin / tool
             executable.write_text(f"#!{sys.executable}\n{STAND_IN}")
             executable.chmod(0o755)
@@ -134,6 +145,7 @@ class TransferTestCase(unittest.TestCase):
             "NOVA_TEST_CHDMAN_STATUS": "0",
             "NOVA_TEST_VERIFY_STATUS": "0",
             "CHDMAN": str(self.bin / "chdman"),
+            "DOLPHIN_TOOL": str(self.bin / "dolphin-tool"),
         }
 
     def file(self, name, content=None):
@@ -291,7 +303,8 @@ class NovaPushTests(TransferTestCase):
             with self.subTest(extension=extension):
                 result = self.assert_invalid("psx", self.file(f"game.{extension}"))
                 self.assertIn("Non-CHD transfers", result.stderr)
-        self.assert_invalid("gamecube", self.file("game.iso"))
+        self.assert_invalid("gamecube", self.file("game.cso"))
+        self.assert_invalid("gamecube", self.file("channel.wad"))
         self.assert_invalid("snes", self.file("disc.iso"))
 
     def test_cartridge_roms_and_archives_are_transferred_unchanged(self):
@@ -430,6 +443,76 @@ class NovaPushTests(TransferTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("maxcso", result.stderr)
         self.assertFalse(any(call[0] == "rsync" for call in self.calls()))
+
+    def test_gamecube_and_wii_images_convert_to_verified_rvz(self):
+        for system in ("gamecube", "triforce", "wii", "wiiware"):
+            for extension in ("iso", "gcm", "gcz", "wbfs", "ciso", "wia"):
+                with self.subTest(system=system, extension=extension):
+                    self.log.unlink(missing_ok=True)
+                    source = self.file(f"Game One.{extension}", b"disc")
+                    result = self.invoke(system, source)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    calls = self.calls()
+                    self.assertEqual(
+                        [call[0] for call in calls],
+                        ["ssh", "dolphin-tool", "dolphin-tool", "dolphin-tool", "rsync"],
+                    )
+                    convert, verify_source, verify_rvz = calls[1:4]
+                    self.assertEqual(convert[1], "convert")
+                    self.assertEqual(
+                        convert[convert.index("-f"):],
+                        ["-f", "rvz", "-c", "zstd", "-l", "5", "-b", "131072"],
+                    )
+                    self.assertEqual(Path(convert[convert.index("-i") + 1]), source)
+                    self.assertEqual(
+                        Path(verify_source[verify_source.index("-i") + 1]), source
+                    )
+                    self.assertTrue(verify_rvz[verify_rvz.index("-i") + 1].endswith(".rvz"))
+                    uploads = calls[-1][calls[-1].index("--") + 1 : -1]
+                    self.assertEqual([Path(path).name for path in uploads], ["Game_One.rvz"])
+                    self.assertTrue(source.exists())
+
+    def test_rvz_dol_and_wii_channels_are_copied_unchanged(self):
+        for system, name in (
+            ("gamecube", "Game.rvz"),
+            ("gamecube", "homebrew.dol"),
+            ("wii", "Game.RVZ"),
+            ("wii", "channel.wad"),
+            ("wiiware", "channel.wad"),
+        ):
+            with self.subTest(system=system, name=name):
+                self.log.unlink(missing_ok=True)
+                source = self.file(name)
+                result = self.invoke(system, source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.calls()
+                self.assertEqual([call[0] for call in calls], ["ssh", "rsync"])
+                uploads = calls[-1][calls[-1].index("--") + 1 : -1]
+                self.assertEqual(uploads, [str(source)])
+
+    def test_rvz_verification_mismatch_never_uploads(self):
+        source = self.file("Game.iso", b"disc")
+        result = self.invoke("gamecube", source, NOVA_TEST_RVZ_MISMATCH="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RVZ verification failed", result.stderr)
+        self.assertFalse(any(call[0] == "rsync" for call in self.calls()))
+
+    def test_missing_dolphin_tool_is_reported_before_connecting(self):
+        source = self.file("Game.iso", b"disc")
+        result = self.invoke("wii", source, DOLPHIN_TOOL="/missing/dolphin-tool")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Convert File", result.stderr)
+        self.assertIn("apt install dolphin-emu", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_rvz_dry_run_previews_without_dolphin_tool(self):
+        source = self.file("Game.wbfs", b"disc")
+        result = self.invoke(
+            "--dry-run", "wii", source, DOLPHIN_TOOL="/missing/dolphin-tool"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Game.rvz (dolphin-tool convert to RVZ)", result.stdout)
+        self.assertFalse(any(call[0] == "dolphin-tool" for call in self.calls()))
 
     def test_ps2_dvd_above_cd_capacity_is_detected_without_conversion(self):
         source = self.file("Large.iso", ps2_iso_data(root_size=2048))
@@ -684,6 +767,26 @@ class NovaPushIntegrationTests(TransferTestCase):
         self.assertTrue(source.exists())
         args = self.calls()[-1]
         self.assertFalse(Path(args[args.index("--") + 1]).parent.exists())
+
+    @unittest.skipUnless(DOLPHIN_TOOL, "dolphin-tool is not installed")
+    def test_real_rvz_conversion_and_upload_round_trip(self):
+        disc = bytearray(os.urandom(4 * 1024 * 1024))
+        disc[0:6] = b"GTSTE8"
+        disc[0x1C:0x20] = (0xC2339F3D).to_bytes(4, "big")  # GameCube disc magic
+        disc[0x20:0x40] = b"PortareOS test disc".ljust(32, b"\0")
+        source = self.file("Test Disc.iso", bytes(disc))
+        result = self.invoke("gamecube", source, DOLPHIN_TOOL=DOLPHIN_TOOL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        uploaded = self.device / "gamecube" / "Test_Disc.rvz"
+        digest = subprocess.run(
+            [DOLPHIN_TOOL, "verify", "-u", str(self.root / "dolphin-user"),
+             "-i", str(uploaded), "-a", "sha1"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        ).stdout.split()[-1]
+        self.assertEqual(digest, hashlib.sha1(disc).hexdigest())
 
     @unittest.skipUnless(CHDMAN, "chdman is not installed")
     def test_real_cso_conversion_and_upload_round_trip(self):
