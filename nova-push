@@ -8,13 +8,16 @@ import errno
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-SUPPORTED = {".cue", ".gdi", ".iso"}
+SUPPORTED = {".cue", ".gdi", ".iso", ".cso"}
+ISO_IMAGES = {".iso", ".cso"}
 ENCODED_AUDIO = {"MP3", "AIFF", "FLAC", "OGG"}
 FILE_LINE = re.compile(r'\s*FILE\s+(?:"([^"]+)"|([^"\s]+))\s+(\S+)\s*', re.IGNORECASE)
 TRACK_LINE = re.compile(r"\s*TRACK\s+\d+\s+(\S+)", re.IGNORECASE)
@@ -100,7 +103,7 @@ def plan_jobs(inputs: list[Path], output: Path | None, recursive: bool) -> list[
         elif source.is_file():
             if source.suffix.lower() not in SUPPORTED:
                 raise ConversionError(
-                    f"Unsupported input: {source.name}. Select a .cue, .gdi or .iso; "
+                    f"Unsupported input: {source.name}. Select a .cue, .gdi, .iso or .cso; "
                     "for BIN or audio tracks, select their CUE sheet."
                 )
             destination = (
@@ -128,7 +131,7 @@ def plan_jobs(inputs: list[Path], output: Path | None, recursive: bool) -> list[
     ]
     if not planned:
         raise ConversionError(
-            "No .cue, .gdi or .iso images found. Use --recursive to search subfolders."
+            "No .cue, .gdi, .iso or .cso images found. Use --recursive to search subfolders."
         )
     destinations: dict[str, Path] = {}
     for job in planned:
@@ -141,6 +144,78 @@ def plan_jobs(inputs: list[Path], output: Path | None, recursive: bool) -> list[
             )
         destinations[key] = job.source
     return planned
+
+
+CSO_MAGIC = b"CISO"
+CSO_PLAIN = 0x80000000
+
+
+def cso_layout(source: Path) -> tuple[int, int, int, list[int]]:
+    """Read a CSO v1 header and index: image size, block size, shift, index."""
+    with source.open("rb") as image:
+        header = image.read(24)
+        if len(header) != 24 or header[:4] != CSO_MAGIC:
+            raise ConversionError(f"{source.name}: not a CSO image")
+        total, block_size = struct.unpack_from("<QI", header, 8)
+        version, align = header[20], header[21]
+        if version > 1:
+            raise ConversionError(
+                f"{source.name}: CSO version {version} is not supported; "
+                "decompress it to an ISO first (maxcso --decompress)."
+            )
+        if not block_size or block_size % 2048:
+            raise ConversionError(f"{source.name}: unsupported CSO block size {block_size}")
+        blocks = -(-total // block_size)
+        raw = image.read(4 * (blocks + 1))
+        if len(raw) != 4 * (blocks + 1):
+            raise ConversionError(f"{source.name}: truncated CSO index")
+    return total, block_size, align, list(struct.unpack(f"<{blocks + 1}I", raw))
+
+
+def cso_blocks(source: Path, first: int = 0, count: int | None = None):
+    """Yield a CSO's blocks decompressed, each block_size bytes but the last."""
+    total, block_size, align, index = cso_layout(source)
+    end_block = len(index) - 1 if count is None else min(len(index) - 1, first + count)
+    with source.open("rb") as image:
+        for number in range(first, end_block):
+            start = (index[number] & ~CSO_PLAIN) << align
+            end = (index[number + 1] & ~CSO_PLAIN) << align
+            image.seek(start)
+            data = image.read(end - start)
+            size = min(block_size, total - number * block_size)
+            if index[number] & CSO_PLAIN:
+                block = data[:size]
+            else:
+                try:
+                    # Raw deflate; the stream may be followed by alignment padding.
+                    block = zlib.decompressobj(-15).decompress(data, size)
+                except zlib.error as error:
+                    raise ConversionError(
+                        f"{source.name}: corrupt CSO block {number}: {error}"
+                    ) from error
+            if len(block) != size:
+                raise ConversionError(f"{source.name}: corrupt CSO block {number}")
+            yield block
+
+
+def decompress_cso(source: Path, target: Path) -> Path:
+    with target.open("wb") as image:
+        for block in cso_blocks(source):
+            image.write(block)
+    return target
+
+
+def disc_probe(source: Path) -> tuple[int, bytes]:
+    """Image size and the 2048-byte sector 16 (ISO9660 PVD) of an ISO or CSO."""
+    if source.suffix.lower() == ".cso":
+        total, block_size, _, _ = cso_layout(source)
+        offset = 16 * 2048
+        block = b"".join(cso_blocks(source, offset // block_size, 1))
+        start = offset % block_size
+        return total, block[start : start + 2048]
+    with source.open("rb") as image:
+        image.seek(16 * 2048)
+        return source.stat().st_size, image.read(2048)
 
 
 def find_tool(name: str, override: str | None) -> str:
@@ -260,15 +335,16 @@ def convert(job: Job, args: argparse.Namespace, chdman: str) -> bool:
         prefix=".portare-chd-", dir=job.output.parent
     ) as temporary:
         work = Path(temporary)
-        image = (
-            prepare_cue(job.source, work, args.ffmpeg)
-            if job.source.suffix.lower() == ".cue"
-            else job.source
-        )
+        suffix = job.source.suffix.lower()
+        if suffix == ".cue":
+            image = prepare_cue(job.source, work, args.ffmpeg)
+        elif suffix == ".cso":
+            print("  Decompressing CSO…", flush=True)
+            image = decompress_cso(job.source, work / "disc.iso")
+        else:
+            image = job.source
         command = (
-            "createdvd"
-            if job.source.suffix.lower() == ".iso" and args.iso_type == "dvd"
-            else "createcd"
+            "createdvd" if suffix in ISO_IMAGES and args.iso_type == "dvd" else "createcd"
         )
         staged = work / "output.chd"
         options = [chdman, command, "-i", str(image), "-o", str(staged)]
@@ -385,7 +461,7 @@ CD_SYSTEMS = {
     "cdi",
 }
 PS2_SYSTEMS = {"ps2", "armsx2"}
-DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis"}
+DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis", "xbox"}
 
 
 @dataclass(frozen=True)
@@ -396,11 +472,9 @@ class Transfer:
 
 
 def detect_ps2_iso_type(source: Path) -> str:
-    """Apply PCSX2's CD/DVD heuristic to a cooked, 2048-byte-sector ISO."""
-    sectors, remainder = divmod(source.stat().st_size, 2048)
-    with source.open("rb") as image:
-        image.seek(16 * 2048)
-        descriptor = image.read(2048)
+    """Apply PCSX2's CD/DVD heuristic to a cooked, 2048-byte-sector ISO or CSO."""
+    size, descriptor = disc_probe(source)
+    sectors, remainder = divmod(size, 2048)
     if remainder or len(descriptor) != 2048 or descriptor[:7] != b"\x01CD001\x01":
         raise ConversionError(
             f"Cannot detect PS2 CD/DVD media type: {source.name}; "
@@ -425,7 +499,7 @@ def detect_ps2_iso_type(source: Path) -> str:
 
 
 def media_type(source: Path, system: str, iso_type: str) -> str:
-    if source.suffix.lower() != ".iso":
+    if source.suffix.lower() not in ISO_IMAGES:
         return "cd"  # CUE/GDI always describe CDs.
     if iso_type != "auto":
         return iso_type
@@ -444,12 +518,16 @@ def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Trans
             system in CARTRIDGE_SYSTEMS and extension in CARTRIDGE_FORMATS
         ):
             passthrough.append(Transfer(source, source))
-        elif extension in SUPPORTED and system in CD_SYSTEMS | DVD_SYSTEMS:
+        elif extension in SUPPORTED and system in CD_SYSTEMS | DVD_SYSTEMS and (
+            # CSO holds 2048-byte sectors: PSP, PS2 and Xbox images, not CDs.
+            extension != ".cso" or system in DVD_SYSTEMS
+        ):
             images.append(source)
         else:
             raise ConversionError(
                 f"Non-CHD transfers are only allowed for cartridge ROMs: {source.name}. "
-                "For supported disc systems, supply a CHD or an ISO/CUE/GDI to convert. "
+                "For supported disc systems, supply a CHD or an ISO/CUE/GDI (CSO for "
+                "PS2, PSP and Xbox) to convert. "
                 "Select the CUE sheet for BIN/audio tracks; extract disc archives first."
             )
 
@@ -587,7 +665,8 @@ def cli_parser() -> argparse.ArgumentParser:
         "       %(prog)s [--host [user@]host] --list\n"
         "       %(prog)s --set-host [user@]host",
         description="Copy files into /storage/roms/<system>/ on a PortareOS device. "
-        "ISO/CUE/GDI disc images are converted to verified CHDs first. "
+        "ISO/CUE/GDI disc images, and CSO for PS2, PSP and Xbox, are converted to "
+        "verified CHDs first. "
         "Cartridge ROMs are copied unchanged; other disc formats are rejected.",
         epilog="Omit the system only when every file extension identifies the same system. "
         "Host priority: --host, then NOVA, then the saved default in "

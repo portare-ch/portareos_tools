@@ -3,8 +3,10 @@ import os
 import shutil
 import subprocess
 import sys
+import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "nova-push"
@@ -27,6 +29,34 @@ def ps2_iso_data(root_size=300):
     descriptor[181] = 2
     data[16 * 2048 : 17 * 2048] = descriptor
     return bytes(data)
+
+
+def cso_data(data, block_size=2048, align=0, version=1, plain=(1,)):
+    """CSO v1 image of data: raw-deflate blocks, the ones in plain stored."""
+    blocks = [data[i : i + block_size] for i in range(0, len(data), block_size)]
+    header = b"CISO" + struct.pack("<IQIBBxx", 24, len(data), block_size, version, align)
+    position = len(header) + 4 * (len(blocks) + 1)
+    index, body = [], bytearray()
+
+    def pad():
+        nonlocal position
+        while position % (1 << align):
+            body.append(0)
+            position += 1
+
+    pad()
+    for number, block in enumerate(blocks):
+        if number in plain:
+            stored, flag = block, 0x80000000
+        else:
+            packer = zlib.compressobj(9, zlib.DEFLATED, -15)
+            stored, flag = packer.compress(block) + packer.flush(), 0
+        index.append((position >> align) | flag)
+        body += stored
+        position += len(stored)
+        pad()
+    index.append(position >> align)
+    return header + struct.pack(f"<{len(index)}I", *index) + bytes(body)
 
 
 # Stand-ins record argv without contacting a device. Integration tests let the
@@ -83,7 +113,9 @@ class TransferTestCase(unittest.TestCase):
         self.config_home = self.root / "config"
         self.config_file = self.config_home / "nova-push" / "host"
         self.device = self.root / "device"
-        for system in ("psx", "ps2", "psp", "pspminis", "dreamcast", "neocd", "neogeocd", "snes"):
+        for system in (
+            "psx", "ps2", "psp", "pspminis", "xbox", "dreamcast", "neocd", "neogeocd", "snes"
+        ):
             (self.device / system).mkdir(parents=True)
         for tool in ("ssh", "rsync", "chdman"):
             executable = self.bin / tool
@@ -291,6 +323,7 @@ class NovaPushTests(TransferTestCase):
             ("neogeocd", "createcd"),
             ("psp", "createdvd"),
             ("pspminis", "createdvd"),
+            ("xbox", "createdvd"),
             ("saturn", "createcd"),
             ("segacd", "createcd"),
             ("pcenginecd", "createcd"),
@@ -371,6 +404,32 @@ class NovaPushTests(TransferTestCase):
                 self.assertEqual(commands, ["createcd", "createdvd", "createcd"])
                 self.assertIn("CD.iso: using chdman createcd", result.stdout)
                 self.assertIn("DVD.iso: using chdman createdvd", result.stdout)
+
+    def test_cso_converts_for_dvd_systems_and_ps2_detects_through_it(self):
+        for system, root_size, command in (
+            ("psp", 300, "createdvd"),
+            ("pspminis", 300, "createdvd"),
+            ("xbox", 300, "createdvd"),
+            ("ps2", 2048, "createcd"),
+            ("ps2", 300, "createdvd"),
+        ):
+            with self.subTest(system=system, command=command):
+                self.log.unlink(missing_ok=True)
+                source = self.file("Game.cso", cso_data(ps2_iso_data(root_size)))
+                result = self.invoke(system, source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = [call for call in self.calls() if call[0] == "chdman"]
+                self.assertEqual([call[1] for call in calls], [command, "verify"])
+                image = Path(calls[0][calls[0].index("-i") + 1])
+                self.assertEqual(image.name, "disc.iso")
+                self.assertIn("Decompressing CSO", result.stdout)
+
+    def test_cso_v2_stops_with_a_maxcso_hint_before_uploading(self):
+        source = self.file("Game.cso", cso_data(ps2_iso_data(300), version=2))
+        result = self.invoke("psp", source)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("maxcso", result.stderr)
+        self.assertFalse(any(call[0] == "rsync" for call in self.calls()))
 
     def test_ps2_dvd_above_cd_capacity_is_detected_without_conversion(self):
         source = self.file("Large.iso", ps2_iso_data(root_size=2048))
@@ -625,6 +684,34 @@ class NovaPushIntegrationTests(TransferTestCase):
         self.assertTrue(source.exists())
         args = self.calls()[-1]
         self.assertFalse(Path(args[args.index("--") + 1]).parent.exists())
+
+    @unittest.skipUnless(CHDMAN, "chdman is not installed")
+    def test_real_cso_conversion_and_upload_round_trip(self):
+        for system, root_size, align, command in (
+            ("psp", 300, 0, "extractdvd"),
+            ("xbox", 300, 2, "extractdvd"),
+            ("ps2", 300, 0, "extractdvd"),
+            ("ps2", 2048, 1, "extractcd"),
+        ):
+            with self.subTest(system=system, align=align, command=command):
+                data = ps2_iso_data(root_size)
+                name = f"{system} {align} {command}"
+                source = self.file(f"{name}.cso", cso_data(data, align=align))
+                result = self.invoke(system, source, CHDMAN=CHDMAN)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                uploaded = self.device / system / f"{name.replace(' ', '_')}.chd"
+                suffix = "cue" if command == "extractcd" else "iso"
+                recovered = self.root / f"{system}-{align}-recovered.{suffix}"
+                result = subprocess.run(
+                    [CHDMAN, command, "-i", str(uploaded), "-o", str(recovered)],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                image = recovered.with_suffix(".bin") if suffix == "cue" else recovered
+                self.assertEqual(image.read_bytes(), data)
 
     @unittest.skipUnless(CHDMAN, "chdman is not installed")
     def test_real_iso_conversion_and_upload_round_trip(self):
