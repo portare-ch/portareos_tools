@@ -163,6 +163,7 @@ in place of `./nova-push` from any folder.
 
 # Override the saved destination for one command. SSH config aliases also work.
 ./nova-push --host my-device psp "Game.iso"
+./nova-push psp "Game.cso"
 ```
 
 The default is saved in `~/.config/nova-push/host` (or
@@ -180,13 +181,15 @@ Disc transfers only upload CHDs. ISO, CUE, and GDI inputs are converted into a
 temporary folder using the built-in converter, then verified before any files
 are uploaded. Existing CHDs are uploaded unchanged. Cartridge systems such as NES,
 SNES, Game Boy, GBA, N64, and Mega Drive keep their ROM formats, including
-BIN/ROM and ZIP/7z cartridge archives. Other non-CHD formats are rejected;
-disc archives must be extracted first, and BIN/audio tracks require their CUE.
+BIN/ROM and ZIP/7z cartridge archives. CSO images (v1, as most PSP and PS2
+CSOs are) are decompressed and converted like an ISO for the DVD systems:
+`ps2`, `psp`/`pspminis` and `xbox`. Other non-CHD formats are rejected; disc
+archives must be extracted first, and BIN/audio tracks require their CUE.
 
 Automatic conversion supports `psx` (SwanStation), `ps2` (ARMSX2), `psp`/`pspminis`,
 `dreamcast` (Flycast), `neocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
-`tg16cd`, `pcfx`, `3do`, and `cdi`. By default (`--iso-type auto`), PS2/ARMSX2
-ISOs are probed individually to select `chdman createcd` or `chdman createdvd`.
+`tg16cd`, `pcfx`, `3do`, `cdi` and `xbox` (xemu). By default (`--iso-type auto`),
+PS2/ARMSX2 ISOs and CSOs are probed individually to select `chdman createcd` or `chdman createdvd`.
 Detection follows the [PCSX2 media detection heuristic](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp):
 images beyond CD capacity use DVD mode; smaller images use the ISO9660 volume
 descriptor's root directory length. A small DVD image can still use DVD mode.
