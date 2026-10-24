@@ -14,11 +14,11 @@ On macOS or Linux:
 curl -fsSL https://raw.githubusercontent.com/portare-ch/portareos_tools/main/install.sh | bash
 ```
 
-This installs `nova-push` and `portare-chd` into `~/.local/bin`, along with any
-missing dependencies. On macOS, install [Homebrew](https://brew.sh/) first and
-follow its PATH setup instructions. On Linux, automatic dependency installation
-supports Debian/Ubuntu (`apt-get`), Fedora (`dnf`), and Arch (`pacman`); it uses
-`sudo` when needed. Fedora uses its
+This installs `nova-push` and `portare-chd` into `~/.local/bin`, along with
+missing Python, chdman, FFmpeg, SSH and rsync dependencies. On macOS, install
+[Homebrew](https://brew.sh/) first and follow its PATH setup instructions. On
+Linux, automatic dependency installation supports Debian/Ubuntu (`apt-get`),
+Fedora (`dnf`), and Arch (`pacman`); it uses `sudo` when needed. Fedora uses its
 [`ffmpeg-free` package](https://packages.fedoraproject.org/pkgs/ffmpeg/ffmpeg-free/).
 Other Linux distributions can install dependencies manually and use `--no-deps`.
 
@@ -41,8 +41,8 @@ bash install.sh --prefix "$HOME/tools" --no-deps
 curl -fsSL https://raw.githubusercontent.com/portare-ch/portareos_tools/main/install.sh | bash -s -- --prefix "$HOME/tools" --no-deps
 ```
 
-`--prefix` installs into the specified directory's `bin` subfolder. With
-`--no-deps`, provide Python 3.10+ and the external tools needed for your usage
+`--prefix` requires an absolute path and installs into that directory's `bin`
+subfolder. With `--no-deps`, install Python 3.10+ and the required external tools
 yourself. Rerun the installer to update both commands. To uninstall, remove
 `nova-push` and `portare-chd` from the installation's `bin` folder; installed
 dependencies and your saved device configuration are kept.
@@ -63,8 +63,10 @@ sudo apt install python3 mame-tools ffmpeg openssh-client rsync
 
 `chdman` is included in `rom-tools` on Homebrew and `mame-tools` on Debian/Ubuntu.
 FFmpeg is only needed for CUE sheets referencing encoded audio, such as MP3.
-You can also specify executable paths with `--chdman` / `--ffmpeg`, or the
-`CHDMAN` / `FFMPEG` environment variables.
+For `portare-chd`, you can also specify executable paths with `--chdman` /
+`--ffmpeg`. Both tools accept the `CHDMAN` / `FFMPEG` environment variables.
+RVZ conversion with `nova-push` needs `dolphin-tool` separately (see below);
+the installer does not install it.
 
 ## Convert
 
@@ -122,7 +124,7 @@ to the selected folder. Spaces in output filenames are replaced with underscores
 (for example, `Metal Slug.cue` becomes `Metal_Slug.chd`). Conflicting output
 names, including those caused by replacing spaces, are reported before any
 conversion. A batch continues after a failed disc and exits with status 1 if
-any disc failed (0 on success, 2 for invalid arguments, 130 for Ctrl+C).
+any disc failed (0 on success, 2 for command-line syntax errors, 130 for Ctrl+C).
 
 Use `-j 4` to limit compression threads or `--no-verify` to skip verification.
 Run `python3 portare_chd.py --help` for all options.
@@ -132,7 +134,8 @@ Run `python3 portare_chd.py --help` for all options.
 `nova-push` copies files over SSH into an existing `/storage/roms/<system>/`
 folder. SSH access must be enabled and `rsync` must also be installed on the
 device. Save your device once, then use it from any terminal. There is no
-built-in address or user.
+built-in address or user. Use an existing system folder name from `--list`;
+names are used literally, without alias mapping.
 
 The examples below run from a checkout. After installation, use `nova-push`
 in place of `./nova-push` from any folder.
@@ -177,21 +180,22 @@ the saved default. The saved file contains only the SSH destination; keys and
 passwords use your normal SSH setup.
 
 Options go before the system and filenames. A dry run still connects to the
-device to check the destination. It reports planned CHD conversions without
-running them, and previews rsync's work for existing CHDs and cartridge ROMs.
+device to check the destination. It reports planned CHD and RVZ conversions
+without running them, and previews rsync's work for files uploaded unchanged.
 Use an SSH config alias for custom ports, identity files, or IPv6 addresses.
 
-Disc transfers only upload CHDs. ISO, CUE, and GDI inputs are converted into a
-temporary folder using the built-in converter, then verified before any files
-are uploaded. Existing CHDs are uploaded unchanged. Cartridge systems such as NES,
-SNES, Game Boy, GBA, N64, and Mega Drive keep their ROM formats, including
+Disc transfers use CHD except for the Dolphin systems described below. ISO,
+CUE, and GDI inputs are converted into a temporary folder using the built-in
+converter, then verified before any files are uploaded. Existing CHDs are
+uploaded unchanged. Cartridge systems such as NES, SNES, Game Boy, GBA, N64,
+and Mega Drive keep their ROM formats, including
 BIN/ROM and ZIP/7z cartridge archives. CSO images (v1, as most PSP and PS2
 CSOs are) are decompressed and converted like an ISO for the DVD systems:
 `ps2`, `psp`/`pspminis` and `xbox`. Other non-CHD formats are rejected; disc
 archives must be extracted first, and BIN/audio tracks require their CUE.
 
-Automatic conversion supports `psx` (SwanStation), `ps2` (ARMSX2), `psp`/`pspminis`,
-`dreamcast` (Flycast), `neocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
+Automatic CHD conversion recognizes `psx` (SwanStation), `ps2` (ARMSX2),
+`psp`/`pspminis`, `dreamcast` (Flycast), `neocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
 `tg16cd`, `pcfx`, `3do`, `cdi` and `xbox` (xemu). By default (`--iso-type auto`),
 PS2/ARMSX2 ISOs and CSOs are probed individually to select `chdman createcd` or `chdman createdvd`.
 Detection follows the [PCSX2 media detection heuristic](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp):
@@ -199,9 +203,9 @@ images beyond CD capacity use DVD mode; smaller images use the ISO9660 volume
 descriptor's root directory length. A small DVD image can still use DVD mode.
 Unrecognized PS2 ISO metadata stops the batch before conversion or upload.
 `--iso-type cd` or `--iso-type dvd` can override detection for unusual images.
-Other CD systems use `createcd`, and PSP uses `createdvd`. CUE and GDI always
-use `createcd`, regardless of the ISO option. Each conversion and dry run shows
-the selected command. Converted filenames replace spaces with underscores.
+Other CD systems use `createcd`, and PSP and Xbox use `createdvd`. CUE and GDI
+always use `createcd`, regardless of the ISO option. Each conversion and dry
+run shows the selected command. Converted filenames replace spaces with underscores.
 
 GameCube, Triforce, Wii and WiiWare games are RVZ instead, Dolphin's lossless
 format: it regenerates the discs' pseudo-random padding and stores Wii data
@@ -214,8 +218,8 @@ anything is uploaded. `dolphin-tool` comes with Debian/Ubuntu's `dolphin-emu`
 package; Dolphin's macOS app does not include it, so on a Mac convert in
 Dolphin (right-click the game, Convert File..., RVZ) and push the `.rvz`. Set
 `DOLPHIN_TOOL` to use another copy.
-Local CHDs beside the inputs are left untouched; temporary CHDs are removed
-after the command finishes, including on failure.
+Local CHDs and RVZs beside the inputs are left untouched; temporary images are
+removed after the command finishes, including on failure.
 
 Specify the system for shared formats such as CHD, ISO, CUE, GDI, BIN, and ZIP.
 Inferred files must all belong to the same system. For CUE/GDI discs, name
@@ -228,12 +232,13 @@ or permissions.
 
 Interrupted transfers keep resumable data in `.nova-push-partial` on the device.
 `--move` uses rsync checksums to compare existing remote content before removing
-each delivered source. For converted inputs, `--move` removes the named source
+each delivered source. For CHD conversions, `--move` removes the named source
 image or descriptor only after the transfer succeeds and rsync has removed
-the temporary CHD. Companion tracks are kept. If conversion or transfer fails,
-original conversion inputs are kept. A failed batch can leave some files
-already transferred and existing CHDs or cartridge ROMs removed locally with
-`--move`. Keep source files unchanged during a move.
+the temporary CHD. Companion tracks are kept. Sources converted to RVZ are
+kept even with `--move`. If conversion or transfer fails, original conversion
+inputs are kept. A failed batch can leave some files already transferred and
+files uploaded unchanged removed locally with `--move`. Keep source files
+unchanged during a move.
 See the [rsync documentation](https://download.samba.org/pub/rsync/rsync.1) for
 transfer and source-removal behavior. Run `./nova-push --help` for usage.
 
