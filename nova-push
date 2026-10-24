@@ -537,7 +537,13 @@ DOLPHIN_KEEP = {".rvz", ".dol"}  # .dol homebrew has no disc
 WII_CHANNEL_SYSTEMS = {"wii", "wiiware"}  # .wad channels are not discs either
 RVZ_OPTIONS = ["-f", "rvz", "-c", "zstd", "-l", "5", "-b", "131072"]
 PS2_SYSTEMS = {"ps2", "armsx2"}
-DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis", "xbox"}
+DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis"}
+# Xbox games are XISO images, copied as they are: hakuX reads no CHD yet. The
+# XDVDFS volume is looked for where hakuX looks (native/core/xdvdfs.c): an
+# extracted XISO, then the game partition of a full XGD1, XGD2 or XGD3 dump.
+XISO_SYSTEMS = {"xbox"}
+XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
+XISO_OFFSETS = (0, 0x18300000, 0xFD90000, 0x2080000)
 
 
 @dataclass(frozen=True)
@@ -584,6 +590,31 @@ def media_type(source: Path, system: str, iso_type: str) -> str:
     return "cd" if system.casefold() in CD_SYSTEMS else "dvd"
 
 
+def is_xiso(source: Path) -> bool:
+    with source.open("rb") as image:
+        for offset in XISO_OFFSETS:
+            image.seek(offset + 32 * 2048)
+            descriptor = image.read(2048)
+            if descriptor[:20] == XISO_MAGIC and descriptor[0x7EC:0x800] == XISO_MAGIC:
+                return True
+    return False
+
+
+def plan_xiso_transfers(sources: list[Path]) -> list[Transfer]:
+    for source in sources:
+        if source.suffix.lower() != ".iso":
+            raise ConversionError(
+                f"Xbox games are XISO images (.iso), copied as they are; hakuX reads "
+                f"no CHD or CSO yet: {source.name}"
+            )
+        if not is_xiso(source):
+            raise ConversionError(
+                f"{source.name}: no Xbox XDVDFS volume found; supply an XISO or a "
+                "full Xbox disc dump"
+            )
+    return [Transfer(source, source) for source in sources]
+
+
 def plan_rvz_transfers(system: str, sources: list[Path], output: Path) -> list[Transfer]:
     transfers = []
     for source in sources:
@@ -609,6 +640,8 @@ def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Trans
     system = system.casefold()
     if system in DOLPHIN_SYSTEMS:
         return check_names(plan_rvz_transfers(system, sources, output))
+    if system in XISO_SYSTEMS:
+        return check_names(plan_xiso_transfers(sources))
     images = []
     passthrough = []
     for source in sources:
@@ -618,7 +651,7 @@ def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Trans
         ):
             passthrough.append(Transfer(source, source))
         elif extension in SUPPORTED and system in CD_SYSTEMS | DVD_SYSTEMS and (
-            # CSO holds 2048-byte sectors: PSP, PS2 and Xbox images, not CDs.
+            # CSO holds 2048-byte sectors: PSP and PS2 images, not CDs.
             extension != ".cso" or system in DVD_SYSTEMS
         ):
             images.append(source)
@@ -626,7 +659,7 @@ def plan_transfers(system: str, sources: list[Path], output: Path) -> list[Trans
             raise ConversionError(
                 f"Non-CHD transfers are only allowed for cartridge ROMs: {source.name}. "
                 "For supported disc systems, supply a CHD or an ISO/CUE/GDI (CSO for "
-                "PS2, PSP and Xbox) to convert. "
+                "PS2 and PSP) to convert. "
                 "Select the CUE sheet for BIN/audio tracks; extract disc archives first."
             )
 
@@ -783,8 +816,9 @@ def cli_parser() -> argparse.ArgumentParser:
         "       %(prog)s [--host [user@]host] --list\n"
         "       %(prog)s --set-host [user@]host",
         description="Copy files into /storage/roms/<system>/ on a PortareOS device. "
-        "ISO/CUE/GDI disc images, and CSO for PS2, PSP and Xbox, are converted to "
+        "ISO/CUE/GDI disc images, and CSO for PS2 and PSP, are converted to "
         "verified CHDs first; GameCube and Wii images to verified RVZ with dolphin-tool. "
+        "Xbox XISOs are checked and copied as they are. "
         "Cartridge ROMs are copied unchanged; other disc formats are rejected.",
         epilog="Omit the system only when every file extension identifies the same system. "
         "Host priority: --host, then NOVA, then the saved default in "
