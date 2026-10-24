@@ -134,8 +134,15 @@ Run `python3 portare_chd.py --help` for all options.
 `nova-push` copies files over SSH into an existing `/storage/roms/<system>/`
 folder. SSH access must be enabled and `rsync` must also be installed on the
 device. Save your device once, then use it from any terminal. There is no
-built-in address or user. Use an existing system folder name from `--list`;
-names are used literally, without alias mapping.
+built-in address or user. Use an existing system folder name from `--list`.
+PortareOS keeps one folder per system, named for the US console, so a
+region's, an add-on's or a hack's games go in their console's folder. The
+old folders' names still work and send their games there: `megadrive`,
+`megadrive-japan`, `genh` and `megadriveh` to `genesis`; `sfc`, `snesh`,
+`satellaview` and `snesmsu1` to `snes`; `famicom` and `fds` to `nes`;
+`megacd` to `segacd`; `ggh`/`gamegearh` to `gamegear`; `gbh`, `gbch`,
+`gbah` and `gbav` to `gb`, `gbc` and `gba`; `n64dd` to `n64`; `pspminis` to
+`psp`; `wiiware` to `wii`; and `triforce` to `gamecube`.
 
 The examples below run from a checkout. After installation, use `nova-push`
 in place of `./nova-push` from any folder.
@@ -157,7 +164,7 @@ in place of `./nova-push` from any folder.
 # PS2 CD and DVD ISOs are detected automatically, including in a single batch.
 ./nova-push ps2 "CD Game.iso" "DVD Game.iso"
 
-# The system can be omitted for extensions such as .sfc, .nes, .gba, and .nds.
+# The system can be omitted for extensions such as .sfc, .nes, .md, .gba, and .nds.
 ./nova-push "Game.sfc"
 
 # Preview a move, then transfer and remove successfully delivered local files.
@@ -191,14 +198,14 @@ uploaded unchanged. Cartridge systems such as NES, SNES, Game Boy, GBA, N64,
 and Mega Drive keep their ROM formats, including
 BIN/ROM and ZIP/7z cartridge archives. CSO images (v1, as most PSP and PS2
 CSOs are) are decompressed and converted like an ISO for the DVD systems:
-`ps2` and `psp`/`pspminis`. Xbox games are the exception: hakuX reads XISO
+`ps2` and `psp`. Xbox games are the exception: hakuX reads XISO
 images, not CHD yet, so an Xbox `.iso` is checked for its XDVDFS volume
 (an extracted XISO or a full disc dump) and uploaded unchanged, and Xbox
 CHDs and CSOs are rejected. Other non-CHD formats are rejected; disc
 archives must be extracted first, and BIN/audio tracks require their CUE.
 
 Automatic CHD conversion recognizes `psx` (SwanStation), `ps2` (ARMSX2),
-`psp`/`pspminis`, `dreamcast` (Flycast), `neocd`, `segacd`/`megacd`, `saturn`, `pcenginecd`/
+`psp`, `dreamcast` (Flycast), `neocd`, `segacd`, `saturn`, `pcenginecd`/
 `tg16cd`, `pcfx`, `3do` and `cdi`. By default (`--iso-type auto`),
 PS2/ARMSX2 ISOs and CSOs are probed individually to select `chdman createcd` or `chdman createdvd`.
 Detection follows the [PCSX2 media detection heuristic](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp):
@@ -210,10 +217,10 @@ Other CD systems use `createcd`, and PSP uses `createdvd`. CUE and GDI
 always use `createcd`, regardless of the ISO option. Each conversion and dry
 run shows the selected command. Converted filenames replace spaces with underscores.
 
-GameCube, Triforce, Wii and WiiWare games are RVZ instead, Dolphin's lossless
+GameCube and Wii games are RVZ instead, Dolphin's lossless
 format: it regenerates the discs' pseudo-random padding and stores Wii data
 decrypted, neither of which CHD can compress. RVZ images and `.dol` homebrew
-are copied unchanged, as are `.wad` channels for `wii`/`wiiware`. ISO, GCM,
+are copied unchanged, as are `.wad` channels for `wii`. ISO, GCM,
 GCZ, WBFS, CISO and WIA images are converted with `dolphin-tool convert`
 (Zstandard level 5, 128 KiB blocks, Dolphin's suggested settings) and verified
 by comparing the SHA-1 of the disc the RVZ decodes to with the source's before

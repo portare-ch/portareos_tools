@@ -435,16 +435,13 @@ def convert_rvz(job: Job, tool: str) -> bool:
 
 CARTRIDGE_SYSTEMS = {
     "nes",
-    "famicom",
     "snes",
-    "sfc",
     "gb",
     "gbc",
     "gba",
     "n64",
     "nds",
     "3ds",
-    "megadrive",
     "genesis",
     "sega32x",
     "mastersystem",
@@ -473,14 +470,18 @@ CARTRIDGE_SYSTEMS = {
 }
 CARTRIDGE_FORMATS = {
     ".nes",
+    ".fds",
     ".sfc",
     ".smc",
+    ".bs",
+    ".bsx",
     ".gb",
     ".gbc",
     ".gba",
     ".z64",
     ".n64",
     ".v64",
+    ".ndd",
     ".nds",
     ".3ds",
     ".md",
@@ -520,7 +521,6 @@ CD_SYSTEMS = {
     "neocd",
     "neogeocd",
     "segacd",
-    "megacd",
     "saturn",
     "pcenginecd",
     "tg16cd",
@@ -531,19 +531,45 @@ CD_SYSTEMS = {
 # GameCube and Wii games are RVZ, Dolphin's lossless format: it regenerates the
 # discs' pseudo-random padding and stores Wii data decrypted, neither of which
 # CHD can compress. dolphin-tool converts the other image formats.
-DOLPHIN_SYSTEMS = {"gamecube", "triforce", "wii", "wiiware"}
+DOLPHIN_SYSTEMS = {"gamecube", "wii"}
 DOLPHIN_IMAGES = {".iso", ".gcm", ".gcz", ".wbfs", ".ciso", ".wia"}
 DOLPHIN_KEEP = {".rvz", ".dol"}  # .dol homebrew has no disc
-WII_CHANNEL_SYSTEMS = {"wii", "wiiware"}  # .wad channels are not discs either
+WII_CHANNEL_SYSTEMS = {"wii"}  # .wad channels are not discs either
 RVZ_OPTIONS = ["-f", "rvz", "-c", "zstd", "-l", "5", "-b", "131072"]
 PS2_SYSTEMS = {"ps2", "armsx2"}
-DVD_SYSTEMS = PS2_SYSTEMS | {"psp", "pspminis"}
+DVD_SYSTEMS = PS2_SYSTEMS | {"psp"}
 # Xbox games are XISO images, copied as they are: hakuX reads no CHD yet. The
 # XDVDFS volume is looked for where hakuX looks (native/core/xdvdfs.c): an
 # extracted XISO, then the game partition of a full XGD1, XGD2 or XGD3 dump.
 XISO_SYSTEMS = {"xbox"}
 XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
 XISO_OFFSETS = (0, 0x18300000, 0xFD90000, 0x2080000)
+# PortareOS keeps one folder per system, named for the US console
+# (portare-ch/portareos#756): a region's, an add-on's or a ROM hack's games
+# go in their console's folder. The old folders' names still work.
+MERGED_SYSTEMS = {
+    "megadrive": "genesis",
+    "megadrive-japan": "genesis",
+    "genh": "genesis",
+    "megadriveh": "genesis",
+    "sfc": "snes",
+    "snesh": "snes",
+    "satellaview": "snes",
+    "snesmsu1": "snes",
+    "famicom": "nes",
+    "fds": "nes",
+    "megacd": "segacd",
+    "ggh": "gamegear",
+    "gamegearh": "gamegear",
+    "gbh": "gb",
+    "gbch": "gbc",
+    "gbah": "gba",
+    "gbav": "gba",
+    "n64dd": "n64",
+    "pspminis": "psp",
+    "wiiware": "wii",
+    "triforce": "gamecube",
+}
 
 
 @dataclass(frozen=True)
@@ -790,14 +816,14 @@ class UsageError(Exception):
 INFERRED_SYSTEMS = {
     extension: system
     for system, extensions in {
-        "nes": ("nes",),
-        "snes": ("sfc", "smc"),
+        "nes": ("nes", "fds"),
+        "snes": ("sfc", "smc", "bs", "bsx"),
         "gb": ("gb",),
         "gbc": ("gbc",),
         "gba": ("gba",),
-        "n64": ("z64", "n64", "v64"),
+        "n64": ("z64", "n64", "v64", "ndd"),
         "nds": ("nds",),
-        "megadrive": ("md", "gen"),
+        "genesis": ("md", "gen"),
         "pcengine": ("pce",),
         "virtualboy": ("vb",),
         "ngpc": ("ngp", "ngc"),
@@ -916,6 +942,9 @@ def infer_system(source: Path) -> str:
 def prepare_inputs(inputs: list[str]) -> tuple[str, list[Path]]:
     infer = Path(inputs[0]).is_file()
     system = infer_system(Path(inputs[0])) if infer else inputs[0]
+    if system in MERGED_SYSTEMS:
+        print(f"nova-push: {system} games go in {MERGED_SYSTEMS[system]}", flush=True)
+        system = MERGED_SYSTEMS[system]
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", system):
         raise UsageError(f"invalid system folder: {system}")
     arguments = inputs if infer else inputs[1:]

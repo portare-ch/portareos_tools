@@ -134,8 +134,8 @@ class TransferTestCase(unittest.TestCase):
         self.config_file = self.config_home / "nova-push" / "host"
         self.device = self.root / "device"
         for system in (
-            "psx", "ps2", "psp", "pspminis", "xbox", "dreamcast", "neocd", "neogeocd", "snes",
-            "gamecube", "triforce", "wii", "wiiware",
+            "psx", "ps2", "psp", "xbox", "dreamcast", "neocd", "neogeocd", "snes",
+            "nes", "genesis", "segacd", "gamecube", "wii",
         ):
             (self.device / system).mkdir(parents=True)
         for tool in ("ssh", "rsync", "chdman", "dolphin-tool"):
@@ -307,6 +307,13 @@ class NovaPushTests(TransferTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls()[-1][-1], "root@test-device:/storage/roms/snes/")
         self.assertFalse(any(call[0] == "chdman" for call in self.calls()))
+        for name, system in (("Sonic.md", "genesis"), ("Zelda.FDS", "nes")):
+            with self.subTest(name=name):
+                result = self.invoke(self.file(name))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.calls()[-1][-1], f"root@test-device:/storage/roms/{system}/"
+                )
 
     def test_disc_formats_that_cannot_be_converted_are_rejected_before_connecting(self):
         for extension in ("bin", "zip", "7z", "pbp", "cso", "rvz", "gcz", "m3u", "sfc"):
@@ -320,8 +327,11 @@ class NovaPushTests(TransferTestCase):
     def test_cartridge_roms_and_archives_are_transferred_unchanged(self):
         for system, name in (
             ("snes", "game.sfc"),
+            ("snes", "game.bs"),
             ("nes", "game.nes"),
-            ("megadrive", "game.bin"),
+            ("nes", "game.fds"),
+            ("genesis", "game.bin"),
+            ("n64", "disk.ndd"),
             ("gba", "game.zip"),
         ):
             with self.subTest(system=system):
@@ -334,6 +344,37 @@ class NovaPushTests(TransferTestCase):
                 )
         self.assertFalse(any(call[0] == "chdman" for call in self.calls()))
 
+    def test_old_folder_names_send_games_to_the_console_folder(self):
+        for old, system, name in (
+            ("megadrive", "genesis", "game.md"),
+            ("megadrive-japan", "genesis", "game.md"),
+            ("sfc", "snes", "game.sfc"),
+            ("satellaview", "snes", "game.bs"),
+            ("fds", "nes", "game.fds"),
+            ("megacd", "segacd", "Game.chd"),
+            ("gamegearh", "gamegear", "hack.gg"),
+            ("ggh", "gamegear", "hack.gg"),
+            ("gbch", "gbc", "hack.gbc"),
+            ("n64dd", "n64", "disk.ndd"),
+            ("pspminis", "psp", "Mini.chd"),
+            ("wiiware", "wii", "channel.wad"),
+            ("triforce", "gamecube", "Game.rvz"),
+        ):
+            with self.subTest(old=old):
+                self.log.unlink(missing_ok=True)
+                result = self.invoke(old, self.file(name))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"{old} games go in {system}", result.stdout)
+                self.assertEqual(
+                    self.calls()[-1][-1], f"root@test-device:/storage/roms/{system}/"
+                )
+        source = self.file("Mini.iso")
+        result = self.invoke("pspminis", source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [call[1] for call in self.calls() if call[0] == "chdman"], ["createdvd", "verify"]
+        )
+
     def test_iso_conversion_uses_system_media_type_and_verifies_before_rsync(self):
         for system, command in (
             ("psx", "createcd"),
@@ -345,7 +386,6 @@ class NovaPushTests(TransferTestCase):
             ("neocd", "createcd"),
             ("neogeocd", "createcd"),
             ("psp", "createdvd"),
-            ("pspminis", "createdvd"),
             ("saturn", "createcd"),
             ("segacd", "createcd"),
             ("pcenginecd", "createcd"),
@@ -430,7 +470,6 @@ class NovaPushTests(TransferTestCase):
     def test_cso_converts_for_dvd_systems_and_ps2_detects_through_it(self):
         for system, root_size, command in (
             ("psp", 300, "createdvd"),
-            ("pspminis", 300, "createdvd"),
             ("ps2", 2048, "createcd"),
             ("ps2", 300, "createdvd"),
         ):
@@ -453,7 +492,7 @@ class NovaPushTests(TransferTestCase):
         self.assertFalse(any(call[0] == "rsync" for call in self.calls()))
 
     def test_gamecube_and_wii_images_convert_to_verified_rvz(self):
-        for system in ("gamecube", "triforce", "wii", "wiiware"):
+        for system in ("gamecube", "wii"):
             for extension in ("iso", "gcm", "gcz", "wbfs", "ciso", "wia"):
                 with self.subTest(system=system, extension=extension):
                     self.log.unlink(missing_ok=True)
@@ -507,7 +546,6 @@ class NovaPushTests(TransferTestCase):
             ("gamecube", "homebrew.dol"),
             ("wii", "Game.RVZ"),
             ("wii", "channel.wad"),
-            ("wiiware", "channel.wad"),
         ):
             with self.subTest(system=system, name=name):
                 self.log.unlink(missing_ok=True)
