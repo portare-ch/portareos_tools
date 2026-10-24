@@ -33,6 +33,16 @@ def ps2_iso_data(root_size=300):
     return bytes(data)
 
 
+def write_xiso(path, offset=0):
+    """Sparse Xbox image: the XDVDFS volume descriptor at sector 32 of offset."""
+    descriptor = bytearray(2048)
+    descriptor[:20] = descriptor[0x7EC:0x800] = b"MICROSOFT*XBOX*MEDIA"
+    with open(path, "wb") as image:
+        image.seek(offset + 32 * 2048)
+        image.write(descriptor)
+    return path
+
+
 def cso_data(data, block_size=2048, align=0, version=1, plain=(1,)):
     """CSO v1 image of data: raw-deflate blocks, the ones in plain stored."""
     blocks = [data[i : i + block_size] for i in range(0, len(data), block_size)]
@@ -336,7 +346,6 @@ class NovaPushTests(TransferTestCase):
             ("neogeocd", "createcd"),
             ("psp", "createdvd"),
             ("pspminis", "createdvd"),
-            ("xbox", "createdvd"),
             ("saturn", "createcd"),
             ("segacd", "createcd"),
             ("pcenginecd", "createcd"),
@@ -422,7 +431,6 @@ class NovaPushTests(TransferTestCase):
         for system, root_size, command in (
             ("psp", 300, "createdvd"),
             ("pspminis", 300, "createdvd"),
-            ("xbox", 300, "createdvd"),
             ("ps2", 2048, "createcd"),
             ("ps2", 300, "createdvd"),
         ):
@@ -471,6 +479,27 @@ class NovaPushTests(TransferTestCase):
                     uploads = calls[-1][calls[-1].index("--") + 1 : -1]
                     self.assertEqual([Path(path).name for path in uploads], ["Game_One.rvz"])
                     self.assertTrue(source.exists())
+
+    def test_xbox_xisos_are_checked_and_copied_unchanged(self):
+        sources = [
+            write_xiso(self.root / "Extracted Game.iso"),
+            write_xiso(self.root / "Redump XGD2.ISO", 0xFD90000),
+        ]
+        result = self.invoke("xbox", *sources)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual([call[0] for call in calls], ["ssh", "rsync"])
+        uploads = calls[-1][calls[-1].index("--") + 1 : -1]
+        self.assertEqual(uploads, [str(source) for source in sources])
+        self.assertEqual(calls[-1][-1], "root@test-device:/storage/roms/xbox/")
+
+    def test_xbox_rejects_chd_cso_and_images_without_xdvdfs(self):
+        for name in ("Game.chd", "Game.cso"):
+            with self.subTest(name=name):
+                result = self.assert_invalid("xbox", self.file(name))
+                self.assertIn("hakuX reads no CHD or CSO yet", result.stderr)
+        result = self.assert_invalid("xbox", self.file("Not Xbox.iso"))
+        self.assertIn("no Xbox XDVDFS volume found", result.stderr)
 
     def test_rvz_dol_and_wii_channels_are_copied_unchanged(self):
         for system, name in (
@@ -792,7 +821,6 @@ class NovaPushIntegrationTests(TransferTestCase):
     def test_real_cso_conversion_and_upload_round_trip(self):
         for system, root_size, align, command in (
             ("psp", 300, 0, "extractdvd"),
-            ("xbox", 300, 2, "extractdvd"),
             ("ps2", 300, 0, "extractdvd"),
             ("ps2", 2048, 1, "extractcd"),
         ):
