@@ -93,6 +93,9 @@ python3 portare_chd.py "Game.cue" "Dreamcast.gdi" "PS2.iso"
 
 # A standalone CD ISO without a CUE sheet.
 python3 portare_chd.py "CD Game.iso" --iso-type cd
+
+# An Xbox XISO becomes a DVD CHD, ready for hakuX 0.6.0 or newer.
+python3 portare_chd.py "Xbox Game.iso" -o ./converted
 ```
 
 Supported inputs are `.cue`, `.gdi`, and `.iso` (including uppercase extensions).
@@ -101,7 +104,7 @@ it describes the track order and gaps. When scanning folders, ISOs referenced
 by a selected CUE sheet are automatically excluded as separate conversions.
 ZIP/7z archives must be extracted first.
 
-Standalone ISOs default to `chdman createdvd`, suitable for DVD and PSP images.
+Standalone ISOs default to `chdman createdvd`, suitable for DVD, PSP and Xbox images.
 Use `--iso-type cd` for standalone CD ISOs; the tool does not guess media type
 from file size. CUE and GDI images always use `chdman createcd`.
 
@@ -161,6 +164,10 @@ in place of `./nova-push` from any folder.
 ./nova-push dreamcast "Game.gdi"
 ./nova-push neocd "Metal Slug.cue"
 
+# Xbox XISOs become DVD CHDs; existing Xbox CHDs are copied directly.
+./nova-push xbox "Game.iso"
+./nova-push xbox "Game.chd"
+
 # PS2 CD and DVD ISOs are detected automatically, including in a single batch.
 ./nova-push ps2 "CD Game.iso" "DVD Game.iso"
 
@@ -198,14 +205,16 @@ uploaded unchanged. Cartridge systems such as NES, SNES, Game Boy, GBA, N64,
 and Mega Drive keep their ROM formats, including
 BIN/ROM and ZIP/7z cartridge archives. CSO images (v1, as most PSP and PS2
 CSOs are) are decompressed and converted like an ISO for the DVD systems:
-`ps2` and `psp`. Xbox games are the exception: hakuX reads XISO
-images, not CHD yet, so an Xbox `.iso` is checked for its XDVDFS volume
-(an extracted XISO or a full disc dump) and uploaded unchanged, and Xbox
-CHDs and CSOs are rejected. Other non-CHD formats are rejected; disc
-archives must be extracted first, and BIN/audio tracks require their CUE.
+`ps2` and `psp`. Xbox `.iso` images are checked for an XDVDFS volume
+(an extracted XISO or a full disc dump), converted with `chdman createdvd`,
+verified, and uploaded as CHDs. Existing Xbox CHDs are uploaded unchanged.
+Xbox CHDs require **hakuX 0.6.0 or newer** on the device. Xbox CSOs and
+CUE/GDI inputs are rejected. Xbox ISO conversion requires DVD mode, so
+`--iso-type cd` is rejected. Other non-CHD formats are rejected; disc archives
+must be extracted first, and BIN/audio tracks require their CUE.
 
 Automatic CHD conversion recognizes `psx` (SwanStation), `ps2` (ARMSX2),
-`psp`, `dreamcast` (Flycast), `neocd`, `segacd`, `saturn`, `pcenginecd`/
+`psp`, `xbox` (hakuX), `dreamcast` (Flycast), `neocd`, `segacd`, `saturn`, `pcenginecd`/
 `tg16cd`, `pcfx`, `3do` and `cdi`. By default (`--iso-type auto`),
 PS2/ARMSX2 ISOs and CSOs are probed individually to select `chdman createcd` or `chdman createdvd`.
 Detection follows the [PCSX2 media detection heuristic](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/CDVD/CDVDcommon.cpp):
@@ -213,7 +222,7 @@ images beyond CD capacity use DVD mode; smaller images use the ISO9660 volume
 descriptor's root directory length. A small DVD image can still use DVD mode.
 Unrecognized PS2 ISO metadata stops the batch before conversion or upload.
 `--iso-type cd` or `--iso-type dvd` can override detection for unusual images.
-Other CD systems use `createcd`, and PSP uses `createdvd`. CUE and GDI
+Other CD systems use `createcd`, and PSP and Xbox use `createdvd`. CUE and GDI
 always use `createcd`, regardless of the ISO option. Each conversion and dry
 run shows the selected command. Converted filenames replace spaces with underscores.
 

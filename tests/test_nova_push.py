@@ -2,9 +2,9 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
-import struct
 import tempfile
 import unittest
 import zlib
@@ -519,7 +519,7 @@ class NovaPushTests(TransferTestCase):
                     self.assertEqual([Path(path).name for path in uploads], ["Game_One.rvz"])
                     self.assertTrue(source.exists())
 
-    def test_xbox_xisos_are_checked_and_copied_unchanged(self):
+    def test_xbox_xisos_are_checked_and_converted_to_verified_dvd_chds(self):
         sources = [
             write_xiso(self.root / "Extracted Game.iso"),
             write_xiso(self.root / "Redump XGD2.ISO", 0xFD90000),
@@ -527,18 +527,68 @@ class NovaPushTests(TransferTestCase):
         result = self.invoke("xbox", *sources)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
-        self.assertEqual([call[0] for call in calls], ["ssh", "rsync"])
+        self.assertEqual(
+            [call[0] for call in calls],
+            ["ssh", "chdman", "chdman", "chdman", "chdman", "rsync"],
+        )
+        self.assertEqual(
+            [call[1] for call in calls if call[0] == "chdman"],
+            ["createdvd", "verify", "createdvd", "verify"],
+        )
         uploads = calls[-1][calls[-1].index("--") + 1 : -1]
-        self.assertEqual(uploads, [str(source) for source in sources])
+        self.assertEqual(
+            [Path(path).name for path in uploads],
+            ["Extracted_Game.chd", "Redump_XGD2.chd"],
+        )
         self.assertEqual(calls[-1][-1], "root@test-device:/storage/roms/xbox/")
+        self.assertTrue(all(source.exists() for source in sources))
+        self.assertTrue(all(not Path(path).exists() for path in uploads))
 
-    def test_xbox_rejects_chd_cso_and_images_without_xdvdfs(self):
-        for name in ("Game.chd", "Game.cso"):
+    def test_xbox_chds_are_copied_unchanged_without_chdman(self):
+        source = self.file("Xbox Game.CHD")
+        result = self.invoke("xbox", source, CHDMAN="/missing/chdman")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertEqual([call[0] for call in calls], ["ssh", "rsync"])
+        self.assertEqual(calls[-1][calls[-1].index("--") + 1 : -1], [str(source)])
+        self.assertEqual(calls[-1][-1], "root@test-device:/storage/roms/xbox/")
+        self.assertTrue(source.exists())
+
+    def test_xbox_rejects_cso_cd_inputs_and_images_without_xdvdfs(self):
+        for name in ("Game.cso", "Game.cue", "Game.gdi"):
             with self.subTest(name=name):
                 result = self.assert_invalid("xbox", self.file(name))
-                self.assertIn("hakuX reads no CHD or CSO yet", result.stderr)
+                self.assertIn("Xbox games need a DVD CHD or an XISO (.iso)", result.stderr)
         result = self.assert_invalid("xbox", self.file("Not Xbox.iso"))
         self.assertIn("no Xbox XDVDFS volume found", result.stderr)
+
+    def test_xbox_cd_override_is_rejected_before_connecting(self):
+        source = write_xiso(self.root / "Game.iso")
+        result = self.invoke("--iso-type", "cd", "xbox", source)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Xbox discs require DVD CHDs", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue(source.exists())
+
+    def test_xbox_dry_run_previews_dvd_conversion_and_existing_chd_transfer(self):
+        source = write_xiso(self.root / "Xbox Game.iso")
+        chd = self.file("Existing.chd")
+        result = self.invoke(
+            "--dry-run", "--move", "xbox", source, chd, CHDMAN="/missing/chdman"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/storage/roms/xbox/Xbox_Game.chd (chdman createdvd)", result.stdout)
+        calls = self.calls()
+        self.assertEqual([call[0] for call in calls], ["ssh", "rsync"])
+        self.assertEqual(calls[-1][calls[-1].index("--") + 1 : -1], [str(chd)])
+        self.assertTrue(source.exists())
+        self.assertTrue(chd.exists())
+
+    def test_xbox_conversion_collisions_are_rejected_before_connecting(self):
+        source = write_xiso(self.root / "Xbox Game.iso")
+        chd = self.file("xbox_game.CHD")
+        result = self.assert_invalid("xbox", source, chd)
+        self.assertIn("duplicate destination filename", result.stderr)
 
     def test_rvz_dol_and_wii_channels_are_copied_unchanged(self):
         for system, name in (
@@ -681,21 +731,24 @@ class NovaPushTests(TransferTestCase):
         self.assertNotIn(str(iso), self.calls()[-1])
 
     def test_conversion_and_verification_failures_never_start_rsync(self):
-        source = self.file("Game.iso")
-        for environment in (
-            {"NOVA_TEST_CHDMAN_STATUS": "1"},
-            {"NOVA_TEST_VERIFY_STATUS": "1"},
-        ):
-            with self.subTest(environment=environment):
-                self.log.unlink(missing_ok=True)
-                result = self.invoke("--move", "ps2", source, **environment)
-                self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertFalse(any(call[0] == "rsync" for call in self.calls()))
-                self.assertTrue(source.exists())
-                self.assertFalse(source.with_suffix(".chd").exists())
-                conversion = next(call for call in self.calls() if call[0] == "chdman")
-                staged = Path(conversion[conversion.index("-o") + 1])
-                self.assertFalse(staged.parent.parent.exists())
+        for system in ("ps2", "xbox"):
+            source = self.file("Game.iso")
+            if system == "xbox":
+                write_xiso(source)
+            for environment in (
+                {"NOVA_TEST_CHDMAN_STATUS": "1"},
+                {"NOVA_TEST_VERIFY_STATUS": "1"},
+            ):
+                with self.subTest(system=system, environment=environment):
+                    self.log.unlink(missing_ok=True)
+                    result = self.invoke("--move", system, source, **environment)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertFalse(any(call[0] == "rsync" for call in self.calls()))
+                    self.assertTrue(source.exists())
+                    self.assertFalse(source.with_suffix(".chd").exists())
+                    conversion = next(call for call in self.calls() if call[0] == "chdman")
+                    staged = Path(conversion[conversion.index("-o") + 1])
+                    self.assertFalse(staged.parent.parent.exists())
 
     def test_missing_chdman_is_reported_before_connecting(self):
         source = self.file("Game.iso")
@@ -819,21 +872,29 @@ class NovaPushIntegrationTests(TransferTestCase):
         self.assertEqual(existing.read_bytes(), b"unrelated existing CHD")
 
     def test_converted_move_removes_iso_only_after_successful_delivery(self):
-        source = self.file("Game Name.iso")
-        result = self.invoke("--move", "ps2", source)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(source.exists())
-        self.assertEqual(
-            (self.device / "ps2" / "Game_Name.chd").read_bytes(), b"converted CHD"
-        )
+        for system in ("ps2", "xbox"):
+            with self.subTest(system=system):
+                source = self.file("Game Name.iso")
+                if system == "xbox":
+                    write_xiso(source)
+                result = self.invoke("--move", system, source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(source.exists())
+                self.assertEqual(
+                    (self.device / system / "Game_Name.chd").read_bytes(), b"converted CHD"
+                )
 
     def test_converted_move_failure_keeps_original_and_cleans_temporary_chd(self):
-        source = self.file("Game.iso")
-        result = self.invoke("--move", "ps2", source, NOVA_TEST_RSYNC_STATUS="23")
-        self.assertEqual(result.returncode, 23, result.stderr)
-        self.assertTrue(source.exists())
-        args = self.calls()[-1]
-        self.assertFalse(Path(args[args.index("--") + 1]).parent.exists())
+        for system in ("ps2", "xbox"):
+            with self.subTest(system=system):
+                source = self.file("Game.iso")
+                if system == "xbox":
+                    write_xiso(source)
+                result = self.invoke("--move", system, source, NOVA_TEST_RSYNC_STATUS="23")
+                self.assertEqual(result.returncode, 23, result.stderr)
+                self.assertTrue(source.exists())
+                args = self.calls()[-1]
+                self.assertFalse(Path(args[args.index("--") + 1]).parent.exists())
 
     @unittest.skipUnless(DOLPHIN_TOOL, "dolphin-tool is not installed")
     def test_real_rvz_conversion_and_upload_round_trip(self):
@@ -854,6 +915,28 @@ class NovaPushIntegrationTests(TransferTestCase):
             check=True,
         ).stdout.split()[-1]
         self.assertEqual(digest, hashlib.sha1(disc).hexdigest())
+
+    @unittest.skipUnless(CHDMAN, "chdman is not installed")
+    def test_real_xbox_iso_conversion_and_upload_round_trip(self):
+        source = write_xiso(self.root / "Xbox Game.iso")
+        with source.open("r+b") as image:
+            image.seek(2048)
+            image.write(os.urandom(3 * 2048))
+        original = source.read_bytes()
+        result = self.invoke("xbox", source, CHDMAN=CHDMAN)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        uploaded = self.device / "xbox" / "Xbox_Game.chd"
+        recovered = self.root / "recovered.iso"
+        subprocess.run(
+            [CHDMAN, "extractdvd", "-i", str(uploaded), "-o", str(recovered)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        self.assertEqual(recovered.read_bytes(), original)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(list((self.device / "xbox").iterdir()), [uploaded])
 
     @unittest.skipUnless(CHDMAN, "chdman is not installed")
     def test_real_cso_conversion_and_upload_round_trip(self):
