@@ -10,6 +10,8 @@ import unittest
 import zlib
 from pathlib import Path
 
+from xbox_images import XBOX_FILES, read_xdvdfs, write_xiso, xdvdfs_data
+
 SCRIPT = Path(__file__).resolve().parents[1] / "nova-push"
 RSYNC = shutil.which("rsync")
 CHDMAN = shutil.which("chdman")
@@ -31,16 +33,6 @@ def ps2_iso_data(root_size=300):
     descriptor[181] = 2
     data[16 * 2048 : 17 * 2048] = descriptor
     return bytes(data)
-
-
-def write_xiso(path, offset=0):
-    """Sparse Xbox image: the XDVDFS volume descriptor at sector 32 of offset."""
-    descriptor = bytearray(2048)
-    descriptor[:20] = descriptor[0x7EC:0x800] = b"MICROSOFT*XBOX*MEDIA"
-    with open(path, "wb") as image:
-        image.seek(offset + 32 * 2048)
-        image.write(descriptor)
-    return path
 
 
 def cso_data(data, block_size=2048, align=0, version=1, plain=(1,)):
@@ -76,6 +68,7 @@ def cso_data(data, block_size=2048, align=0, version=1, plain=(1,)):
 STAND_IN = r"""
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -97,6 +90,10 @@ if tool == "dolphin-tool":
 if tool == "chdman":
     if args[0] == "verify":
         sys.exit(int(os.environ.get("NOVA_TEST_VERIFY_STATUS", "0")))
+    inputs = os.environ.get("NOVA_TEST_CHDMAN_INPUTS")
+    if inputs:
+        kept = Path(inputs) / f"{len(os.listdir(inputs))}.img"
+        shutil.copyfile(args[args.index("-i") + 1], kept)
     Path(args[args.index("-o") + 1]).write_bytes(b"converted CHD")
     sys.exit(0)
 real_rsync = os.environ.get("NOVA_TEST_RSYNC")
@@ -590,6 +587,109 @@ class NovaPushTests(TransferTestCase):
         result = self.assert_invalid("xbox", source, chd)
         self.assertIn("duplicate destination filename", result.stderr)
 
+    def test_xbox_full_dumps_are_rebuilt_as_xisos_in_a_temporary_folder(self):
+        games = self.root / "games"
+        games.mkdir()
+        extracted = write_xiso(games / "Extracted.iso")
+        inputs = self.root / "chdman-inputs"
+        for offset in (0x18300000, 0xFD90000, 0x2080000):
+            with self.subTest(offset=hex(offset)):
+                self.log.unlink(missing_ok=True)
+                shutil.rmtree(inputs, ignore_errors=True)
+                inputs.mkdir()
+                source = write_xiso(games / "Game (USA).iso", offset)
+                before = source.stat()
+                result = self.invoke(
+                    "xbox", source, extracted, NOVA_TEST_CHDMAN_INPUTS=inputs
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(
+                    "Game (USA).iso: full Xbox disc dump: rebuild as an XISO, "
+                    "then chdman createdvd",
+                    result.stdout,
+                )
+                self.assertIn("Extracted.iso: using chdman createdvd", result.stdout)
+                calls = self.calls()
+                self.assertEqual(
+                    [call[:2] for call in calls if call[0] == "chdman"],
+                    [["chdman", "createdvd"], ["chdman", "verify"]] * 2,
+                )
+                rebuilt = Path(calls[1][calls[1].index("-i") + 1])
+                self.assertFalse(rebuilt.is_relative_to(self.root))
+                self.assertFalse(rebuilt.parent.exists())
+                # An XISO is converted directly, as before.
+                self.assertEqual(calls[3][calls[3].index("-i") + 1], str(extracted))
+                uploads = calls[-1][calls[-1].index("--") + 1 : -1]
+                self.assertEqual(
+                    [Path(path).name for path in uploads],
+                    ["Game_(USA).chd", "Extracted.chd"],
+                )
+
+                xiso = (inputs / "0.img").read_bytes()
+                self.assertEqual(read_xdvdfs(xiso, self), XBOX_FILES)
+                self.assertEqual(struct.unpack_from("<I", xiso, 0x10014)[0], 0x108)
+                self.assertEqual(xiso[0x1001C:0x10024], b"filetime")
+                self.assertEqual(len(xiso) % 0x10000, 0)
+                self.assertNotIn(b"video partition", xiso)
+                self.assertNotIn(b"sector filler", xiso)
+                kept = (inputs / "1.img").read_bytes()
+                self.assertEqual(kept, extracted.read_bytes())
+                self.assertEqual(sorted(games.iterdir()), sorted([source, extracted]))
+                self.assertEqual(
+                    (source.stat().st_size, source.stat().st_mtime_ns),
+                    (before.st_size, before.st_mtime_ns),
+                )
+
+    def test_xbox_full_dump_dry_run_describes_the_rebuild_without_writing(self):
+        source = write_xiso(self.root / "Xbox Game.iso", 0x18300000)
+        before = sorted(self.root.iterdir())
+        result = self.invoke("--dry-run", "xbox", source, CHDMAN="/missing/chdman")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"would convert and verify {source} "
+            "-> root@test-device:/storage/roms/xbox/Xbox_Game.chd "
+            "(full Xbox disc dump: rebuild as an XISO, then chdman createdvd)",
+            result.stdout,
+        )
+        self.assertEqual([call[0] for call in self.calls()], ["ssh"])
+        after = sorted(path for path in self.root.iterdir() if path != self.log)
+        self.assertEqual(after, before)
+
+    def test_damaged_xbox_dumps_stop_before_conversion_or_upload(self):
+        for names, message in (
+            ((b"default.xbe",), "/default.xbe extends past the end of the image"),
+            ((b"media",), "directory /media/"),
+            # Directories sharing a table (here the root's): each table is read
+            # once, so damaged trees cannot multiply the paths to walk.
+            ((b"levels", b"media"), "directory /levels/"),
+            ((b"Beta.TXT",), "directory /"),  # an entry that is its own child
+        ):
+            with self.subTest(names=names):
+                self.log.unlink(missing_ok=True)
+                data = bytearray(xdvdfs_data(XBOX_FILES))
+                root_sector = struct.unpack_from("<I", data, 32 * 2048 + 20)[0]
+                root = root_sector * 2048
+                for name in names:
+                    entry = data.index(name, root) - 14
+                    if name == b"Beta.TXT":
+                        struct.pack_into("<H", data, entry + 2, (entry - root) // 4)
+                    else:
+                        sector = root_sector if len(names) > 1 else 0x7FFFFF
+                        struct.pack_into("<I", data, entry + 4, sector)
+                source = self.root / "Damaged.iso"
+                with source.open("wb") as image:
+                    image.seek(0x18300000)
+                    image.write(data)
+                result = self.invoke("xbox", source)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    f"Damaged.iso: damaged Xbox file system ({message}); "
+                    "check the dump",
+                    result.stderr,
+                )
+                self.assertEqual([call[0] for call in self.calls()], ["ssh"])
+                self.assertTrue(source.exists())
+
     def test_rvz_dol_and_wii_channels_are_copied_unchanged(self):
         for system, name in (
             ("gamecube", "Game.rvz"),
@@ -937,6 +1037,24 @@ class NovaPushIntegrationTests(TransferTestCase):
         self.assertEqual(recovered.read_bytes(), original)
         self.assertEqual(source.read_bytes(), original)
         self.assertEqual(list((self.device / "xbox").iterdir()), [uploaded])
+
+    @unittest.skipUnless(CHDMAN, "chdman is not installed")
+    def test_real_xbox_full_dump_is_rebuilt_converted_and_uploaded(self):
+        source = write_xiso(self.root / "Xbox Game (USA).iso", 0x18300000)
+        result = self.invoke("xbox", source, CHDMAN=CHDMAN)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        uploaded = self.device / "xbox" / "Xbox_Game_(USA).chd"
+        recovered = self.root / "recovered.iso"
+        subprocess.run(
+            [CHDMAN, "extractdvd", "-i", str(uploaded), "-o", str(recovered)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        self.assertEqual(read_xdvdfs(recovered.read_bytes(), self), XBOX_FILES)
+        self.assertEqual(list((self.device / "xbox").iterdir()), [uploaded])
+        self.assertTrue(source.exists())
 
     @unittest.skipUnless(CHDMAN, "chdman is not installed")
     def test_real_cso_conversion_and_upload_round_trip(self):
