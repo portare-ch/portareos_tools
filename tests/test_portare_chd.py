@@ -12,6 +12,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import portare_chd as chd
+from xbox_images import XBOX_FILES, read_xdvdfs, write_xiso, xdvdfs_data
+
+REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 class WorkspaceTest(unittest.TestCase):
@@ -266,6 +269,103 @@ class FailureTests(WorkspaceTest):
         self.assertFalse(output.exists())
 
 
+class XboxTests(WorkspaceTest):
+    def convert(self, image, *options):
+        """Convert with chdman stubbed: the commands it got, the images it
+        read (none for the source itself) and the console output."""
+        output = self.root / f"out-{len(list(self.root.iterdir()))}" / "Game.chd"
+        args = chd.parser().parse_args([str(image), *options])
+        commands, images = [], []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            if command[1] != "verify":
+                source = Path(command[command.index("-i") + 1])
+                images.append(None if source == image else source.read_bytes())
+                Path(command[command.index("-o") + 1]).write_bytes(b"converted CHD")
+
+        with (
+            patch.object(chd, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()) as console,
+        ):
+            self.assertTrue(chd.convert(chd.Job(image, output), args, "chdman"))
+        self.assertEqual(output.read_bytes(), b"converted CHD")
+        self.assertEqual(list(output.parent.glob(".portare-chd-*")), [])
+        return commands, images, console.getvalue()
+
+    def test_full_dumps_are_rebuilt_as_xisos_in_the_staging_folder(self):
+        games = self.root / "games"
+        games.mkdir()
+        for offset in (0x18300000, 0xFD90000, 0x2080000):
+            with self.subTest(offset=hex(offset)):
+                source = write_xiso(games / "Game (USA).iso", offset)
+                before = source.stat()
+                commands, images, console = self.convert(source)
+                self.assertIn("Full Xbox disc dump: rebuilding", console)
+                self.assertEqual(
+                    [command[1] for command in commands], ["createdvd", "verify"]
+                )
+                rebuilt = Path(commands[0][commands[0].index("-i") + 1])
+                self.assertTrue(rebuilt.parent.name.startswith(".portare-chd-"))
+                self.assertFalse(rebuilt.parent.exists())
+                self.assertEqual(read_xdvdfs(images[0], self), XBOX_FILES)
+                self.assertEqual(len(images[0]) % 0x10000, 0)
+                self.assertNotIn(b"video partition", images[0])
+                self.assertNotIn(b"sector filler", images[0])
+                self.assertEqual(list(games.iterdir()), [source])
+                self.assertEqual(
+                    (source.stat().st_size, source.stat().st_mtime_ns),
+                    (before.st_size, before.st_mtime_ns),
+                )
+
+    def test_xisos_other_dvds_and_cd_conversions_use_the_source(self):
+        for name, data, options, command in (
+            ("XISO.iso", None, (), "createdvd"),
+            ("PS2.iso", bytes(range(256)) * 256, (), "createdvd"),
+            ("Dump as CD.iso", 0x18300000, ("--iso-type", "cd"), "createcd"),
+        ):
+            with self.subTest(name=name):
+                image = self.root / name
+                if isinstance(data, bytes):
+                    image.write_bytes(data)
+                else:
+                    write_xiso(image, data or 0)
+                commands, images, console = self.convert(image, *options)
+                self.assertEqual(commands[0][1], command)
+                self.assertEqual(images, [None])
+                self.assertNotIn("Full Xbox disc dump", console)
+
+    def test_damaged_dump_stops_before_chdman_and_cleans_staging(self):
+        data = bytearray(xdvdfs_data(XBOX_FILES))
+        root = struct.unpack_from("<I", data, 32 * 2048 + 20)[0] * 2048
+        struct.pack_into("<I", data, data.index(b"default.xbe", root) - 10, 0x7FFFFF)
+        source = self.root / "Damaged.iso"
+        with source.open("wb") as image:
+            image.seek(0x18300000)
+            image.write(data)
+        output = self.root / "out" / "Damaged.chd"
+        args = chd.parser().parse_args([str(source)])
+        with (
+            patch.object(chd, "run", side_effect=AssertionError("must not convert")),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(
+                chd.ConversionError,
+                r"Damaged\.iso: damaged Xbox file system "
+                r"\(/default\.xbe extends past the end of the image\)",
+            ),
+        ):
+            chd.convert(chd.Job(source, output), args, "chdman")
+        self.assertEqual(list(output.parent.iterdir()), [])
+
+    def test_xiso_rebuild_is_identical_in_both_tools(self):
+        def block(path):
+            text = (REPOSITORY / path).read_text()
+            start = text.index("# Xbox XISO rebuild, kept identical")
+            return text[start : text.index("# End of the Xbox XISO rebuild.", start)]
+
+        self.assertEqual(block("portare_chd.py"), block("nova-push"))
+
+
 @unittest.skipUnless(shutil.which("chdman"), "chdman not installed")
 class IntegrationTests(WorkspaceTest):
     def command(self, *arguments):
@@ -298,6 +398,13 @@ class IntegrationTests(WorkspaceTest):
         recovered = self.root / "recovered.iso"
         self.command("chdman", "extractdvd", "-i", result, "-o", recovered)
         self.assertEqual(recovered.read_bytes(), data)
+
+    def test_full_xbox_dump_round_trip(self):
+        image = write_xiso(self.root / "Xbox Game (USA).iso", 0x18300000)
+        result = self.convert_cli(image)
+        recovered = self.root / "recovered.iso"
+        self.command("chdman", "extractdvd", "-i", result, "-o", recovered)
+        self.assertEqual(read_xdvdfs(recovered.read_bytes(), self), XBOX_FILES)
 
     def test_standalone_cd_iso_round_trip(self):
         data = bytes(range(256)) * 256

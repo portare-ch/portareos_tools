@@ -8,11 +8,13 @@ import errno
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 SUPPORTED = {".cue", ".gdi", ".iso"}
 ENCODED_AUDIO = {"MP3", "AIFF", "FLAC", "OGG"}
@@ -223,6 +225,250 @@ def prepare_cue(source: Path, work: Path, ffmpeg: str | None) -> Path:
     return cue
 
 
+# Xbox XISO rebuild, kept identical in nova-push and portare_chd.py (the tests
+# compare the two copies).
+#
+# An Xbox image's XDVDFS volume is where hakuX looks for it: at the start of an
+# XISO, or after the video partition of a full XGD1, XGD2 or XGD3 disc dump.
+# The video partition and the filler in the game partition's unused sectors
+# don't compress, so a full dump is rebuilt as an XISO first, as extract-xiso
+# -r does: the game partition's files packed one after another
+# (https://xboxdevwiki.net/XDVDFS).
+XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
+XISO_OFFSETS = (0, 0x18300000, 0xFD90000, 0x2080000)
+XDVDFS_SECTOR = 2048
+XDVDFS_DIRECTORY = 0x10
+XISO_ROOT_SECTOR = 0x108
+XISO_MODULUS = 0x10000
+COPY_CHUNK = 4 << 20
+
+
+def xdvdfs_partition(source: Path) -> int | None:
+    """The XDVDFS game partition's offset: 0 in an XISO, None if there is none."""
+    with source.open("rb") as image:
+        for offset in XISO_OFFSETS:
+            image.seek(offset + 32 * XDVDFS_SECTOR)
+            descriptor = image.read(XDVDFS_SECTOR)
+            if descriptor[:20] == XISO_MAGIC and descriptor[0x7EC:0x800] == XISO_MAGIC:
+                return offset
+    return None
+
+
+@dataclass(eq=False)
+class XdvdfsEntry:
+    """A file or directory of a dump's XDVDFS tree, and its place in the XISO."""
+
+    name: bytes
+    attributes: int
+    sector: int
+    size: int
+    children: list[XdvdfsEntry] | None = None  # None for files
+    target: int = 0  # start sector in the XISO
+    # Directories: the table as (entry, offset, left offset, right offset).
+    nodes: list[tuple[XdvdfsEntry, int, int, int]] = field(default_factory=list)
+    table_size: int = 0
+
+
+def xdvdfs_sectors(size: int) -> int:
+    return -(-size // XDVDFS_SECTOR)
+
+
+def read_xdvdfs(
+    image: BinaryIO, source: Path, partition: int, sector: int, size: int
+) -> list[XdvdfsEntry]:
+    """The root directory's entries, and recursively its subdirectories'. Each
+    table is a binary tree: u16 left and right child offsets in dwords, u32
+    start sector, u32 size, u8 attributes, u8 name length, name."""
+    end = os.fstat(image.fileno()).st_size
+    tables: set[int] = set()  # each directory's table is read once
+
+    def damaged(detail: str) -> ConversionError:
+        return ConversionError(
+            f"{source.name}: damaged Xbox file system ({detail}); check the dump"
+        )
+
+    def directory(sector: int, size: int, path: str, depth: int) -> list[XdvdfsEntry]:
+        if not size:
+            return []
+        start = partition + sector * XDVDFS_SECTOR
+        if depth > 32 or sector in tables or size > 64 << 20 or start + size > end:
+            raise damaged(f"directory {path}")
+        tables.add(sector)
+        image.seek(start)
+        table = image.read(size)
+        entries = []
+        pending, seen = [0], set()
+        while pending:
+            offset = pending.pop()
+            if offset in seen or offset + 14 > size:
+                raise damaged(f"directory {path}")
+            seen.add(offset)
+            left, right, first, length, attributes, name_length = struct.unpack_from(
+                "<HHIIBB", table, offset
+            )
+            if left == 0xFFFF:
+                continue  # 0xFF padding: an empty directory's table
+            name = table[offset + 14 : offset + 14 + name_length]
+            if len(name) != name_length:
+                raise damaged(f"directory {path}")
+            entry = XdvdfsEntry(name, attributes, first, length)
+            display = path + name.decode("ascii", "replace")
+            if attributes & XDVDFS_DIRECTORY:
+                entry.children = directory(first, length, display + "/", depth + 1)
+            elif partition + first * XDVDFS_SECTOR + length > end:
+                raise damaged(f"{display} extends past the end of the image")
+            entries.append(entry)
+            pending.extend(4 * child for child in (right, left) if child)
+        return entries
+
+    return directory(sector, size, "/", 0)
+
+
+def xiso_order(entry: XdvdfsEntry) -> tuple[int, ...]:
+    """extract-xiso's name order: ASCII upper-cased, compared as signed C chars."""
+    return tuple(
+        (c - 32 if 97 <= c <= 122 else c) - (256 if c > 127 else 0) for c in entry.name
+    )
+
+
+def plan_xiso(directory: XdvdfsEntry) -> None:
+    """Lay out a directory's table, then its subdirectories': a balanced binary
+    tree of the sorted names, in prefix order, each entry 4-byte aligned and
+    never across a sector."""
+    ordered = sorted(directory.children or [], key=xiso_order)
+
+    def prefix(low: int, high: int):
+        if low < high:
+            middle = (low + high - 1) // 2
+            yield low, middle, high
+            yield from prefix(low, middle)
+            yield from prefix(middle + 1, high)
+
+    spans = list(prefix(0, len(ordered)))
+    offsets: dict[int, int] = {}
+    size = 0
+    for _, middle, _ in spans:
+        length = (14 + len(ordered[middle].name) + 3) & ~3
+        if size // XDVDFS_SECTOR != (size + length - 1) // XDVDFS_SECTOR:
+            size = xdvdfs_sectors(size) * XDVDFS_SECTOR
+        offsets[middle] = size
+        size += length
+    directory.nodes = [
+        (
+            ordered[middle],
+            offsets[middle],
+            offsets[(low + middle - 1) // 2] if low < middle else 0,
+            offsets[(middle + high) // 2] if middle + 1 < high else 0,
+        )
+        for low, middle, high in spans
+    ]
+    directory.table_size = size or XDVDFS_SECTOR  # an empty table is a padding sector
+    for entry in ordered:
+        if entry.children is not None:
+            plan_xiso(entry)
+
+
+def place_xiso(directory: XdvdfsEntry, sector: int) -> int:
+    """Assign sectors: the directory's table, its files, then its subdirectories.
+    Returns the next free sector."""
+    directory.target = sector
+    sector += xdvdfs_sectors(directory.table_size)
+    for entry, *_ in directory.nodes:
+        if entry.children is None:
+            entry.target = sector
+            sector += xdvdfs_sectors(entry.size)
+    for entry, *_ in directory.nodes:
+        if entry.children is not None:
+            sector = place_xiso(entry, sector)
+    return sector
+
+
+def write_xiso_directory(
+    image: BinaryIO,
+    output: BinaryIO,
+    source: Path,
+    partition: int,
+    directory: XdvdfsEntry,
+) -> None:
+    """Write a directory's table, its files, then its subdirectories, padding
+    each to a sector with 0xFF."""
+    table = bytearray(b"\xff" * (xdvdfs_sectors(directory.table_size) * XDVDFS_SECTOR))
+    for entry, offset, left, right in directory.nodes:
+        size = (
+            entry.size
+            if entry.children is None
+            else xdvdfs_sectors(entry.table_size) * XDVDFS_SECTOR
+        )
+        struct.pack_into(
+            f"<HHIIBB{len(entry.name)}s",
+            table,
+            offset,
+            left // 4,
+            right // 4,
+            entry.target,
+            size,
+            entry.attributes,
+            len(entry.name),
+            entry.name,
+        )
+    output.write(table)
+    for entry, *_ in directory.nodes:
+        if entry.children is not None:
+            continue
+        image.seek(partition + entry.sector * XDVDFS_SECTOR)
+        remaining = entry.size
+        while remaining:
+            chunk = image.read(min(remaining, COPY_CHUNK))
+            if not chunk:
+                raise ConversionError(f"{source.name}: the image ended early")
+            output.write(chunk)
+            remaining -= len(chunk)
+        output.write(b"\xff" * (-entry.size % XDVDFS_SECTOR))
+    for entry, *_ in directory.nodes:
+        if entry.children is not None:
+            write_xiso_directory(image, output, source, partition, entry)
+
+
+def rebuild_xiso(source: Path, target: Path, partition: int) -> Path:
+    """Rewrite a full dump's game partition as an XISO, laid out as extract-xiso
+    -r does: the volume descriptor at sector 32, the root table at sector 0x108,
+    each table followed by its directory's files and then its subdirectories;
+    zeros pad the image to 64 KiB. File contents are copied unchanged."""
+    with source.open("rb") as image:
+        image.seek(partition + 32 * XDVDFS_SECTOR)
+        volume = image.read(XDVDFS_SECTOR)
+        root_sector, root_size = struct.unpack_from("<II", volume, 20)
+        root = XdvdfsEntry(
+            b"",
+            XDVDFS_DIRECTORY,
+            root_sector,
+            root_size,
+            read_xdvdfs(image, source, partition, root_sector, root_size),
+        )
+        plan_xiso(root)
+        place_xiso(root, XISO_ROOT_SECTOR)
+        descriptor = bytearray(XDVDFS_SECTOR)
+        descriptor[:20] = descriptor[0x7EC:] = XISO_MAGIC
+        struct.pack_into(
+            "<II8s",
+            descriptor,
+            20,
+            root.target,
+            xdvdfs_sectors(root.table_size) * XDVDFS_SECTOR,
+            volume[28:36],  # the disc's timestamp
+        )
+        with target.open("wb") as output:
+            output.write(bytes(32 * XDVDFS_SECTOR))
+            output.write(descriptor)
+            output.write(bytes((XISO_ROOT_SECTOR - 33) * XDVDFS_SECTOR))
+            write_xiso_directory(image, output, source, partition, root)
+            output.write(bytes(-output.tell() % XISO_MODULUS))
+    return target
+
+
+# End of the Xbox XISO rebuild.
+
+
 def publish(staged: Path, output: Path, overwrite: bool) -> None:
     if overwrite:
         os.replace(staged, output)
@@ -260,16 +506,26 @@ def convert(job: Job, args: argparse.Namespace, chdman: str) -> bool:
         prefix=".portare-chd-", dir=job.output.parent
     ) as temporary:
         work = Path(temporary)
-        image = (
-            prepare_cue(job.source, work, args.ffmpeg)
-            if job.source.suffix.lower() == ".cue"
-            else job.source
-        )
         command = (
             "createdvd"
             if job.source.suffix.lower() == ".iso" and args.iso_type == "dvd"
             else "createcd"
         )
+        # XISOs convert directly; full Xbox disc dumps are rebuilt as XISOs first.
+        partition = xdvdfs_partition(job.source) if command == "createdvd" else 0
+        if job.source.suffix.lower() == ".cue":
+            image = prepare_cue(job.source, work, args.ffmpeg)
+        elif partition:
+            print(
+                "  Full Xbox disc dump: rebuilding the game partition as an XISO…",
+                flush=True,
+            )
+            image = rebuild_xiso(job.source, work / "disc.iso", partition)
+            print(
+                f"  XISO: {image.stat().st_size / (1024 * 1024):.1f} MiB", flush=True
+            )
+        else:
+            image = job.source
         staged = work / "output.chd"
         options = [chdman, command, "-i", str(image), "-o", str(staged)]
         # Use established codecs supported by handheld emulators' libchdr.
@@ -302,7 +558,9 @@ def positive_int(value: str) -> int:
 def parser() -> argparse.ArgumentParser:
     cli = argparse.ArgumentParser(
         description="PortareOS CHD converter for macOS and Linux. Source files are kept.",
-        epilog="Select the CUE for multi-track games (including ISO + MP3). Standalone ISOs default to DVD/PSP format.",
+        epilog="Select the CUE for multi-track games (including ISO + MP3). "
+        "Standalone ISOs default to DVD/PSP format; full Xbox disc dumps are "
+        "rebuilt as XISOs (game partition only) first.",
     )
     cli.add_argument(
         "inputs", type=Path, nargs="+", help="CUE, GDI, ISO files or folders"

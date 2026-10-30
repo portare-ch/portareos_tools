@@ -94,7 +94,7 @@ python3 portare_chd.py "Game.cue" "Dreamcast.gdi" "PS2.iso"
 # A standalone CD ISO without a CUE sheet.
 python3 portare_chd.py "CD Game.iso" --iso-type cd
 
-# An Xbox XISO becomes a DVD CHD, ready for hakuX 0.6.0 or newer.
+# An Xbox XISO or full disc dump becomes a DVD CHD, ready for hakuX 0.6.0 or newer.
 python3 portare_chd.py "Xbox Game.iso" -o ./converted
 ```
 
@@ -108,6 +108,13 @@ Standalone ISOs default to `chdman createdvd`, suitable for DVD, PSP and Xbox im
 Use `--iso-type cd` for standalone CD ISOs; the tool does not guess media type
 from file size. CUE and GDI images always use `chdman createcd`.
 
+In DVD mode (the default), a full Xbox disc dump, such as a Redump image, is
+recognized by its XDVDFS volume after the video partition and first rebuilt as
+an XISO in the temporary folder, as `extract-xiso -r` does: the game
+partition's files packed one after another, without the video partition or the
+filler in unused sectors, which doesn't compress. File contents are copied
+unchanged. XISOs are converted as they are.
+
 The converter prepares MP3/AIFF/FLAC/OGG CUE audio as stereo, 44.1 kHz, 16-bit
 PCM WAV in a temporary folder, padding the last CD sector with silence where
 needed. It preserves the CUE's track indexes and pregap/postgap directives.
@@ -118,8 +125,8 @@ Each result is checked with `chdman verify` before it is published. Original
 files are kept. Existing CHDs are skipped; `--overwrite` replaces them only
 after the new conversion succeeds. Temporary files are cleaned up after
 success, failure, or Ctrl+C. Allow room in the output folder for decoded audio
-and the resulting CHD. On FAT/exFAT volumes, source tracks and the final CHD
-are copied where symbolic links or hard links are unavailable.
+or a rebuilt XISO, and the resulting CHD. On FAT/exFAT volumes, source tracks
+and the final CHD are copied where symbolic links or hard links are unavailable.
 
 Without `-o`, CHDs are written beside their source CUE/GDI/ISO. With `-o`,
 file inputs go directly into that folder; folder inputs retain paths relative
@@ -164,7 +171,7 @@ in place of `./nova-push` from any folder.
 ./nova-push dreamcast "Game.gdi"
 ./nova-push neocd "Metal Slug.cue"
 
-# Xbox XISOs become DVD CHDs; existing Xbox CHDs are copied directly.
+# Xbox XISOs and full disc dumps become DVD CHDs; existing Xbox CHDs are copied directly.
 ./nova-push xbox "Game.iso"
 ./nova-push xbox "Game.chd"
 
@@ -207,7 +214,12 @@ BIN/ROM and ZIP/7z cartridge archives. CSO images (v1, as most PSP and PS2
 CSOs are) are decompressed and converted like an ISO for the DVD systems:
 `ps2` and `psp`. Xbox `.iso` images are checked for an XDVDFS volume
 (an extracted XISO or a full disc dump), converted with `chdman createdvd`,
-verified, and uploaded as CHDs. Existing Xbox CHDs are uploaded unchanged.
+verified, and uploaded as CHDs. A full disc dump, such as a Redump image,
+is first rebuilt as an XISO in the temporary folder, as `extract-xiso -r`
+does: the game partition's files packed one after another, without the video
+partition or the filler in unused sectors, which doesn't compress. File
+contents are copied unchanged; the temporary folder needs room for the XISO
+and the CHD. Existing Xbox CHDs are uploaded unchanged.
 Xbox CHDs require **hakuX 0.6.0 or newer** on the device. Xbox CSOs and
 CUE/GDI inputs are rejected. Xbox ISO conversion requires DVD mode, so
 `--iso-type cd` is rejected. Other non-CHD formats are rejected; disc archives
