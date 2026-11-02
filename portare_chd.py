@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026-present PortareOS
 """Convert disc images to CHD on macOS and Linux using chdman and FFmpeg."""
 
 from __future__ import annotations

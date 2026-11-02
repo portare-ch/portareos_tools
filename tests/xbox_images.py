@@ -1,3 +1,4 @@
+# Copyright (C) 2026-present PortareOS
 """Synthetic Xbox disc images for the nova-push and portare-chd tests."""
 
 import os

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026-present PortareOS
 # Install from a checkout or with curl .../install.sh | bash.
 set -eo pipefail
 work=''
