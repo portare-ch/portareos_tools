@@ -1,3 +1,4 @@
+# Copyright (C) 2026-present PortareOS
 import json
 import os
 import shutil

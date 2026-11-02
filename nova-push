@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026-present PortareOS
 """Copy or move ROMs to PortareOS over SSH, converting disc images to CHD."""
 
 from __future__ import annotations

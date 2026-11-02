@@ -1,3 +1,4 @@
+# Copyright (C) 2026-present PortareOS
 import contextlib
 import errno
 import io
